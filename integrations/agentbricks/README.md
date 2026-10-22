@@ -662,6 +662,53 @@ removes the corresponding `AGENT_MEMORY_STORE` or `AGENT_SESSION_STORE` entry fr
 Unbinding does not delete the store or revoke an existing grant to the App's service principal.
 If access must be revoked, coordinate that separately with the store owner or workspace admin.
 
+### LangGraph memory store as a BaseStore
+
+LangGraph's `BaseStore` interface lets a graph persist and retrieve facts during execution. `DatabricksMemoryStore` is a `BaseStore` backed by the managed memory store, allowing a LangGraph agent to maintain long-term memory in Databricks without a custom checkpointer or database connection. It integrates with the same memory stores used by the `memory_tools` above.
+
+Use `memory_store()` to create or reuse a `BaseStore` for your graph. It returns an in-memory store if no persistent store is configured, so your agent code works unchanged whether memory is provisioned or not:
+
+```python
+from databricks_agentkit.langgraph import checkpointer, thread_config, memory_store
+
+# memory_store() resolves: store arg → AGENT_MEMORY_STORE → agent.toml binding → InMemoryStore + warning
+store = memory_store(actor=actor_id)
+
+# Pass it to your StateGraph or CompiledGraph
+graph = ... # your LangGraph graph definition
+agent = graph.compile(...)
+
+# Within an invocation, read and write memory by key
+await store.aget(("path", "/key"))  # returns Item or None
+await store.aput(("path", "/key"), {"data": "value"})
+await store.aput(("path", "/key"), None)  # delete
+```
+
+The store is scoped by `actor` (who the memory belongs to; set from trusted application context, never from a user-supplied value — see security notes below) and by `path` (the memory's location in the graph's namespace). Read the store at the start of a turn to load memories before the LLM runs, and write during or after the turn when the agent decides to remember facts.
+
+The `actor` argument takes precedence; if omitted, it comes from the run config's `configurable` dict under the key set by `thread_config(session_id, actor)` (by default `"actor_id"`). Without an explicit actor, the store requires a running context:
+
+```python
+# Explicit actor: works in any context (sync, async, main, or within an invocation)
+store = memory_store(actor="user-123")
+
+# Implicit actor: requires a running LangGraph config context
+store = memory_store()  # reads actor from get_config()["configurable"]["actor_id"]
+```
+
+Python 3.10 does not support `get_config()` in async code; pass `actor=` explicitly when using Python 3.10.
+
+Limit operations at a time to one path per LangGraph invocation. The store returns a single item per `get` or `delete`, and `search` returns up to 100 results ranked by relevance over the entry's content and description — the ranking is performed by the managed-memory service and does not support client-side embeddings or custom index fields. Batch and pagination happen at the API level, not on the BaseStore surface. `list` operations cost one request per call and apply filters (limit, prefix, suffix, depth) client-side, so avoid high-volume list calls in a loop. Persistence uses last-writer-wins: concurrent writes to one path may overwrite each other. No time-to-live or expiration is supported; entries persist indefinitely unless deleted.
+
+Strict mode lets you enforce that a request-supplied identity matches the actor your graph uses. Pass `strict_user_key="langgraph_user_id"` when creating the store; if the config has that key and it differs from the actor, the store raises an error. This is opt-in and off by default:
+
+```python
+# Strict mode: raises if config["configurable"]["langgraph_user_id"] != actor
+store = memory_store(actor="user-123", strict_user_key="langgraph_user_id")
+```
+
+> **Actor partitions data; it is not access control. The store, not the actor, is the security boundary.** Memory entries are separated by actor within a store, but the store itself is workspace-scoped and authorized at the store level: any principal that can access the store can read and write every actor's entries. There are no per-actor or per-entry access controls. For strict isolation between tenants, trust domains, or users, create a separate store per boundary and grant access with `memory_store.grant_permission(principal_id)`. A `strict_user_key` check does not authorize the operation — it only validates that a request's identity matches the actor; the workspace still needs store-level access to proceed. Always set actor from trusted application code (a service principal or signed-in user obtained from the Databricks SDK), never from a model-selected value or user-supplied field.
+
 ## Model and prompt upgrades (experimental)
 
 `agentbricks experimental models` and `agentbricks experimental prompts` find the best model and
