@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 from databricks_agentbricks.errors import TRANSIENT_ERROR_CODES, AgentCliError, wrap_api_error
 from databricks_agentkit import models
+from databricks_agentkit._user_agent import _tag_workspace_client
 from databricks_agentkit.runtime import model_services, prompt_registry
 
 if TYPE_CHECKING:
@@ -134,20 +135,23 @@ def _workspace_client(profile: Optional[str]) -> WorkspaceClient:
 
     client = _bound_retry_timeout(WorkspaceClient(profile=profile))
     if not profile or not client.config.workspace_id:
-        return client
+        return _tag_workspace_client(client, component="api")
 
     configured_host = _profile_host(profile)
     resolved_host = client.config.host
     if not configured_host or configured_host.rstrip("/") == (resolved_host or "").rstrip("/"):
-        return client
+        return _tag_workspace_client(client, component="api")
 
     workspace_id = str(client.config.workspace_id)
-    return _bound_retry_timeout(
-        WorkspaceClient(
-            profile=profile,
-            host=configured_host,
-            custom_headers={"X-Databricks-Org-Id": workspace_id},
-        )
+    return _tag_workspace_client(
+        _bound_retry_timeout(
+            WorkspaceClient(
+                profile=profile,
+                host=configured_host,
+                custom_headers={"X-Databricks-Org-Id": workspace_id},
+            )
+        ),
+        component="api",
     )
 
 
