@@ -1,741 +1,448 @@
-"""Tests for the DatabricksMemoryStore BaseStore implementation over the AgentKit SDK.
+"""DatabricksMemoryStore: ops, paths, filters, search window, errors and the in-process fallback.
 
-Coverage: T01-T38, T51-T58 from the mapping table.
+The real store drives the real AgentKitClient, MemoryStores, MemoryStore and Memory wrappers. Only
+the workspace transport is faked (``_memory_api_fake``). Run-config and graph behaviour lives in
+``langgraph_store_graph_test.py``.
 """
 
-import threading
+import json
+import logging
+from contextlib import contextmanager
 from datetime import datetime, timezone
-from urllib.parse import quote
 
 import pytest
-from _langgraph_store_fakes import STORE, create_fake_api_fixture
-from langgraph.store.base import (
-    GetOp,
-    ListNamespacesOp,
-    PutOp,
-    SearchOp,
-)
 
-from databricks_agentkit.memory_store import Memory, MemorySearchResult, MemoryStore
+pytest.importorskip("langgraph")
 
+from _memory_api_fake import STORE, install  # noqa: E402
+from langchain_core.runnables import RunnableConfig  # noqa: E402
+from langgraph.config import var_child_runnable_config  # noqa: E402
 
-class FakeMemoryStoreHandle:
-    """Adapts FakeMemoryApi to MemoryStore handle interface for testing."""
-
-    def __init__(self, api):
-        self.api = api
-        self.store_id = STORE
-
-    def put(self, actor_id: str, path: str, content: str, session_id=None):
-        """Put an entry."""
-        self.api.create_memory_entry(
-            self.store_id, actor_id, path, content=content, session_id=session_id
-        )
-
-    def list(self, actor_id: str, *, path=None, path_prefix=None, session_id=None, page_size=None):
-        """List entries."""
-        response = self.api.list_memory_entries(
-            self.store_id,
-            actor_id,
-            path=path,
-            path_prefix=path_prefix,
-            session_id=session_id,
-        )
-        # Create a dummy store for constructing Memory objects.
-        dummy_store = MemoryStore(
-            name=f"memory-stores/{self.store_id}",
-            display_name="Test Store",
-            _client=self,
-        )
-        for entry in response.get("managed_memory_entries", []):
-            yield Memory(
-                name=entry["name"],
-                actor_id=entry["actor_id"],
-                path=entry["path"],
-                session_id=entry.get("session_id"),
-                content=entry.get("content"),
-                create_time=entry.get("create_time"),
-                update_time=entry.get("update_time"),
-                _store=dummy_store,
-                _client=self,
-            )
-
-    def search(self, actor_id: str, *, query=None, path_prefix=None, limit=None, session_id=None):
-        """Search entries."""
-        response = self.api.search_memory_entries(
-            self.store_id,
-            actor_id,
-            query=query,
-            path_prefix=path_prefix,
-            limit=limit,
-            session_id=session_id,
-        )
-        dummy_store = MemoryStore(
-            name=f"memory-stores/{self.store_id}",
-            display_name="Test Store",
-            _client=self,
-        )
-        for item in response.get("results", []):
-            entry = item["memory"]
-            memory = Memory(
-                name=entry["name"],
-                actor_id=entry["actor_id"],
-                path=entry["path"],
-                session_id=entry.get("session_id"),
-                content=entry.get("content"),
-                create_time=entry.get("create_time"),
-                update_time=entry.get("update_time"),
-                _store=dummy_store,
-                _client=self,
-            )
-            yield MemorySearchResult(memory=memory, score=item.get("score", 1.0))
-
-    def _update_memory(self, store, memory_id, content=None, description=None):
-        """Update a memory entry."""
-        return self.api.update_memory_entry(
-            store, memory_id, content=content, description=description
-        )
-
-    def _delete_memory(self, store, memory_id):
-        """Delete a memory entry."""
-        return self.api.delete_memory_entry(store, memory_id)
+from databricks_agentbricks.errors import AgentCliError  # noqa: E402
+from databricks_agentkit.langgraph import store as store_mod  # noqa: E402
 
 
 @pytest.fixture
 def api(monkeypatch):
-    """Provide a fake memory API and wire it into the AgentKit client."""
-    fake = create_fake_api_fixture(monkeypatch)
-
-    # Add memory_stores attribute that AgentKitClient expects
-    class MemoryStoresWrapper:
-        def __init__(self, api):
-            self.api = api
-
-        def _handle(self, store_id: str):
-            return FakeMemoryStoreHandle(self.api)
-
-    fake.memory_stores = MemoryStoresWrapper(fake)
-    return fake
+    return install(monkeypatch)
 
 
-@pytest.fixture
-def store_factory(api):
-    """Factory to create DatabricksMemoryStore instances without importing it yet."""
-
-    def _make(store_id: str = STORE, actor: str = "alice", **kwargs):
-        from databricks_agentkit.langgraph.store import DatabricksMemoryStore
-
-        return DatabricksMemoryStore(store=store_id, actor=actor, **kwargs)
-
-    return _make
+def _store(actor="alice", **kwargs):
+    return store_mod.DatabricksMemoryStore(store=STORE, actor=actor, **kwargs)
 
 
-def test_store_import_possible(store_factory):
-    """Verify the store can be imported and instantiated."""
-    store = store_factory()
-    assert store is not None
-
-
-def test_store_put_get_roundtrip(store_factory, api):
-    """Test basic put and get operations with JSON values."""
-    store = store_factory()
-
-    # Put a simple value.
-    value = {"msg": "hello", "count": 42}
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key1", value=value),
-        ]
-    )
-
-    # Get it back.
-    result = store.batch(
-        [
-            GetOp(namespace=("ns",), key="key1"),
-        ]
-    )
-    item = result[0]
-    assert item is not None
-    assert item.value == value
-    assert item.namespace == ("ns",)
-    assert item.key == "key1"
-
-
-def test_store_put_delete_via_none(store_factory, api):
-    """Test that PutOp(value=None) deletes the item."""
-    store = store_factory()
-
-    # Put an item.
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key1", value={"data": "value"}),
-        ]
-    )
-
-    # Delete via None.
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key1", value=None),
-        ]
-    )
-
-    # Verify it's gone.
-    result = store.batch(
-        [
-            GetOp(namespace=("ns",), key="key1"),
-        ]
-    )
-    assert result[0] is None
-
-
-def test_store_get_missing_returns_none(store_factory):
-    """Test that GetOp for a missing item returns None."""
-    store = store_factory()
-    result = store.batch(
-        [
-            GetOp(namespace=("ns",), key="missing"),
-        ]
-    )
-    assert result[0] is None
-
-
-def test_store_path_encoding_roundtrip(store_factory, api):
-    """Test that paths with special characters round-trip correctly."""
-    store = store_factory()
-
-    special_chars = ["/", "%", ".", "..", " ", "hello world", "cafe", "abc"]
-    for char_value in special_chars:
-        namespace_encoded = quote(char_value, safe="")
-        # Use the encoded form as part of the namespace.
-        namespace = (f"ns-{namespace_encoded}", char_value)
-        key = f"key-{namespace_encoded}"
-
-        value = {"test": f"value-{char_value}"}
-        store.batch(
-            [
-                PutOp(namespace=namespace, key=key, value=value),
-            ]
-        )
-
-        result = store.batch(
-            [
-                GetOp(namespace=namespace, key=key),
-            ]
-        )
-        item = result[0]
-        assert item is not None
-        assert item.value == value
-        assert item.namespace == namespace
-        assert item.key == key
-
-
-def test_store_json_value_roundtrip(store_factory):
-    """Test that complex JSON values round-trip exactly."""
-    store = store_factory()
-
-    complex_value = {
-        "string": "hello",
-        "number": 42,
-        "float": 3.14,
-        "bool": True,
-        "null": None,
-        "list": [1, 2, 3],
-        "nested": {"deep": {"value": "here"}},
-        "unicode": "cafe",
+@contextmanager
+def run_as(actor, **configurable):
+    """Run the body inside a LangGraph run config for ``actor`` (thread ``s1``)."""
+    config: RunnableConfig = {
+        "configurable": {"thread_id": "s1", "actor_id": actor, **configurable}
     }
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key", value=complex_value),
-        ]
+    token = var_child_runnable_config.set(config)
+    try:
+        yield
+    finally:
+        var_child_runnable_config.reset(token)
+
+
+# --- paths and keys ----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("key", "segment"),
+    [(".", "%2E"), ("..", "%2E%2E"), ("a/b", "a%2Fb"), ("%x", "%25x"), ("café", "caf%C3%A9")],
+)
+def test_keys_round_trip_as_percent_encoded_paths(api, key, segment):
+    store = _store()
+    store.put(("ns",), key, {"v": key})
+
+    assert [row["path"] for row in api.rows()] == [f"/langgraph/ns/{segment}"]
+    assert store.get(("ns",), key).value == {"v": key}
+    assert [(item.namespace, item.key) for item in store.search(("ns",))] == [(("ns",), key)]
+
+
+def test_namespace_labels_with_slash_round_trip(api):
+    store = _store()
+    namespace = ("a/b", "c d")
+    store.put(namespace, "k", {"v": 1})
+
+    assert [row["path"] for row in api.rows()] == ["/langgraph/a%2Fb/c%20d/k"]
+    assert store.get(namespace, "k").value == {"v": 1}
+    [hit] = store.search(("a/b",))
+    assert (hit.namespace, hit.key) == (namespace, "k")
+    assert store.list_namespaces() == [namespace]
+
+
+def test_rejected_inputs_raise_without_touching_the_service(api):
+    with pytest.raises(ValueError, match="key must be a non-empty string"):
+        _store().put(("ns",), "", {"v": 1})
+    with pytest.raises(ValueError, match="root must start with"):
+        store_mod.DatabricksMemoryStore(store=STORE, actor="alice", root="/x/")
+    with pytest.raises(NotImplementedError, match="TTL"):
+        _store().put(("ns",), "k", {"v": 1}, ttl=5.0)
+    with pytest.raises(NotImplementedError, match="index"):
+        _store().put(("ns",), "k", {"v": 1}, index=["text"])
+    assert api.calls == []
+
+
+# --- put, get, overwrite, delete -----------------------------------------------
+
+
+def test_put_get_and_overwrite_take_the_create_conflict_then_update_path(api):
+    store = _store()
+    store.put(("ns",), "k", {"msg": "héllo", "n": 1})
+    item = store.get(("ns",), "k")
+
+    assert (item.namespace, item.key, item.value) == (("ns",), "k", {"msg": "héllo", "n": 1})
+    assert api.rows()[0]["content"] == '{"msg":"héllo","n":1}'
+
+    api.calls.clear()
+    store.put(("ns",), "k", {"msg": "v2"})
+
+    # The create hits ALREADY_EXISTS, then the store looks the entry up and updates it.
+    assert api.routes() == ["create", "list", "update"]
+    assert store.get(("ns",), "k").value == {"msg": "v2"}
+    assert len(api.rows()) == 1
+
+
+def test_description_is_the_text_of_the_string_values(api):
+    store = _store()
+    store.put(
+        ("ns",), "k", {"title": "Trip", "tags": ["paris", {"note": "  spaced\n out "}], "n": 3}
     )
+    store.put(("ns",), "long", {"text": "x" * 600})
 
-    result = store.batch(
-        [
-            GetOp(namespace=("ns",), key="key"),
-        ]
+    descriptions = {row["path"].rsplit("/", 1)[-1]: row["description"] for row in api.rows()}
+    assert descriptions == {"k": "Trip paris spaced out", "long": "x" * 500}
+
+
+def test_delete_removes_only_the_exact_key_and_a_missing_key_is_a_noop(api):
+    store = _store()
+    store.put(("ns",), "k", {"v": 1})
+    store.put(("ns",), "k2", {"v": 2})
+
+    store.put(("ns",), "k", None)
+    assert [row["path"] for row in api.rows()] == ["/langgraph/ns/k2"]
+    assert store.get(("ns",), "k") is None
+    assert store.get(("ns",), "k2").value == {"v": 2}
+
+    api.calls.clear()
+    store.put(("ns",), "never-written", None)
+    assert api.routes() == ["list"]  # looked up, found nothing, deleted nothing
+
+
+@pytest.mark.parametrize(
+    ("error_code", "status", "commit", "expect_error"),
+    [
+        # The entry was already removed (a retried or raced delete): the store treats it as done.
+        pytest.param("NOT_FOUND", 404, True, False, id="not-found-is-noop"),
+        # Any other error reaches the caller, and the entry is still there.
+        pytest.param("PERMISSION_DENIED", 403, False, True, id="other-errors-propagate"),
+    ],
+)
+def test_delete_treats_not_found_as_done_and_propagates_other_errors(
+    api, error_code, status, commit, expect_error
+):
+    store = _store()
+    store.put(("ns",), "k", {"v": 1})
+    api.fail("delete", error_code, status=status, commit=commit)
+
+    if not expect_error:
+        store.put(("ns",), "k", None)
+        assert store.get(("ns",), "k") is None
+        return
+    with pytest.raises(AgentCliError) as exc:
+        store.put(("ns",), "k", None)
+    assert exc.value.error_code == error_code
+    assert store.get(("ns",), "k").value == {"v": 1}
+
+
+def test_item_times_come_from_the_server(api):
+    api.seed(
+        "/langgraph/ns/k",
+        '{"v":1}',
+        create_time="2026-01-02T03:04:05.000000Z",
+        update_time="2026-02-03T04:05:06.000000Z",
     )
-    assert result[0].value == complex_value
+    item = _store().get(("ns",), "k")
+
+    assert item.created_at == datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+    assert item.updated_at == datetime(2026, 2, 3, 4, 5, 6, tzinfo=timezone.utc)
 
 
-def test_store_created_updated_timestamps(store_factory, api):
-    """Test that created_at and updated_at are set correctly."""
-    store = store_factory()
-
-    now_before = datetime.now(timezone.utc)
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key", value={"data": "initial"}),
-        ]
-    )
-    now_after = datetime.now(timezone.utc)
-
-    result = store.batch(
-        [
-            GetOp(namespace=("ns",), key="key"),
-        ]
-    )
-    item = result[0]
-    assert item.created_at is not None
-    assert item.updated_at is not None
-    assert now_before <= item.created_at <= now_after
+# --- what the store must never return ----------------------------------------
 
 
-def test_store_session_scoping_write_cross_session(store_factory, api):
-    """Test that writes use session_id=None (cross-session)."""
-    store = store_factory()
+@pytest.mark.parametrize("ignore_filters", [False, True], ids=["server-filters", "server-ignores"])
+def test_session_foreign_and_non_object_entries_are_invisible(api, ignore_filters):
+    api.ignore_filters = ignore_filters
+    api.seed("/langgraph/ns/k", '{"color":"tea"}')
+    api.seed("/langgraph/ns/sess", '{"color":"tea"}', session_id="s1")
+    api.seed("/langgraph/ns/fact", "User likes tea")  # a plain-text fact from memory_tools
+    api.seed("/langgraph/ns/arr", '["tea"]')
+    api.seed("/langgraph/ns/num", "1")
+    api.seed("/langgraph/ns/empty", None)
+    api.seed("/other/ns/x", '{"color":"tea"}')  # outside the store's root
+    api.seed("/langgraph/sessonly/x", '{"color":"tea"}', session_id="s1")  # only a session
+    store = _store()
 
-    # Write an item (should not set session_id).
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key", value={"data": "value"}),
-        ]
-    )
-
-    # Verify it was written without session_id.
-    assert len(api.entries) == 1
-    entry = list(api.entries.values())[0]
-    assert "session_id" not in entry
-
-
-def test_store_search_with_query(store_factory, api):
-    """Test search with a natural language query returns results."""
-    store = store_factory()
-
-    # Put some items.
-    store.batch(
-        [
-            PutOp(namespace=("docs",), key="doc1", value={"title": "Python guide"}),
-            PutOp(namespace=("docs",), key="doc2", value={"title": "Rust book"}),
-        ]
-    )
-
-    # Search with a query (BM25 keyword search).
-    # Note: Query-based search filtering happens on the server side,
-    # so our fake API doesn't implement the actual BM25 filtering.
-    # Just verify the search method works without error.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("docs",), query="python"),
-        ]
-    )
-    # The result is a list (may be empty in our fake API).
-    assert isinstance(result[0], list)
+    assert store.get(("ns",), "k").value == {"color": "tea"}
+    for hidden in ("sess", "fact", "arr", "num", "empty"):
+        assert store.get(("ns",), hidden) is None
+    assert [item.key for item in store.search(("ns",))] == ["k"]
+    assert [item.key for item in store.search(("ns",), query="tea")] == ["k"]
+    assert store.list_namespaces() == [("ns",)]
 
 
-def test_store_search_without_query(store_factory, api):
-    """Test search without query (list operation)."""
-    store = store_factory()
-
-    # Put some items.
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key1", value={"a": 1}),
-            PutOp(namespace=("ns",), key="key2", value={"b": 2}),
-        ]
-    )
-
-    # Search without query (list all in namespace).
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",)),
-        ]
-    )
-    items = result[0]
-    assert len(items) == 2
+# --- search without a query -----------------------------------------------------
 
 
-def test_store_search_with_filter(store_factory, api):
-    """Test search with filter criteria."""
-    store = store_factory()
-
-    # Put items with different values.
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="item1", value={"status": "active", "count": 5}),
-            PutOp(namespace=("ns",), key="item2", value={"status": "inactive", "count": 10}),
-        ]
-    )
-
-    # Search with filter.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",), filter={"status": "active"}),
-        ]
-    )
-    items = result[0]
-    # Verify we got results (actual filtering depends on impl).
-    assert len(items) >= 0
-
-
-def test_store_search_with_limits(store_factory, api):
-    """Test that search respects limit and offset parameters."""
-    store = store_factory()
-
-    # Put multiple items.
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="k1", value={"x": 1}),
-            PutOp(namespace=("ns",), key="k2", value={"x": 2}),
-            PutOp(namespace=("ns",), key="k3", value={"x": 3}),
-        ]
-    )
-
-    # Search with limit.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",), limit=2),
-        ]
-    )
-    items = result[0]
-    assert len(items) <= 2
-
-
-def test_store_list_namespaces(store_factory, api):
-    """Test list_namespaces operation."""
-    store = store_factory()
-
-    # Put items with various namespaces.
-    store.batch(
-        [
-            PutOp(namespace=("users", "alice", "docs"), key="doc1", value={"x": 1}),
-            PutOp(namespace=("users", "bob", "docs"), key="doc2", value={"y": 2}),
-            PutOp(namespace=("posts",), key="p1", value={"z": 3}),
-        ]
-    )
-
-    # List all namespaces.
-    result = store.batch(
-        [
-            ListNamespacesOp(match_conditions=None),
-        ]
-    )
-    namespaces = result[0]
-    # Should include the namespaces we created.
-    assert len(namespaces) > 0
-
-
-def test_store_paging_search(store_factory, api):
-    """Test that search results are paginated correctly."""
-    store = store_factory()
-
-    # Put many items.
+def test_search_without_query_returns_the_prefix_with_exact_offset_and_limit(api):
+    store = _store()
     for i in range(5):
-        store.batch(
-            [
-                PutOp(namespace=("ns",), key=f"key{i}", value={"num": i}),
-            ]
-        )
+        store.put(("ns", "sub"), f"k{i}", {"i": i})
+    store.put(("ns",), "x", {"i": 9})
+    store.put(("nsx",), "y", {"i": 8})  # a sibling namespace must not match the prefix
 
-    # Search with limit and offset.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",), limit=2, offset=1),
-        ]
-    )
-    items = result[0]
-    # Offset/limit is applied client-side.
-    assert len(items) > 0
-
-
-def test_store_ttl_not_implemented(store_factory):
-    """Test that TTL support raises NotImplementedError."""
-    store = store_factory()
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        store.batch(
-            [
-                PutOp(namespace=("ns",), key="key", value={"data": "value"}, ttl=60.0),
-            ]
-        )
-    assert "TTL" in str(exc_info.value)
-
-
-def test_store_index_list_not_implemented(store_factory):
-    """Test that index list configuration raises NotImplementedError."""
-    store = store_factory()
-
-    with pytest.raises(NotImplementedError) as exc_info:
-        store.batch(
-            [
-                PutOp(
-                    namespace=("ns",),
-                    key="key",
-                    value={"data": "value"},
-                    index=["field1", "field2"],
-                ),
-            ]
-        )
-    assert "index" in str(exc_info.value)
-
-
-def test_store_supports_ttl_false(store_factory):
-    """Test that supports_ttl is False."""
-    store = store_factory()
-    assert store.supports_ttl is False
-
-
-def test_store_batch_resolve_actor_once(store_factory, api):
-    """Test that batch resolves the actor once for all operations."""
-    store = store_factory(actor="alice")
-
-    ops = [
-        PutOp(namespace=("ns",), key="key1", value={"a": 1}),
-        PutOp(namespace=("ns",), key="key2", value={"b": 2}),
-        GetOp(namespace=("ns",), key="key1"),
+    assert sorted(item.key for item in store.search(("ns",), limit=10)) == [
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+        "x",
+    ]
+    assert [item.key for item in store.search(("ns", "sub"), limit=3, offset=1)] == [
+        "k1",
+        "k2",
+        "k3",
     ]
 
-    results = store.batch(ops)
-    assert len(results) == 3
-    assert results[2] is not None  # Get should find the key
+
+def test_search_without_query_follows_the_server_pages(api):
+    api.server_page_size = 2
+    store = _store()
+    for i in range(5):
+        store.put(("ns",), f"k{i}", {"i": i})
+    api.calls.clear()
+
+    assert [item.key for item in store.search(("ns",), limit=10)] == [
+        "k0",
+        "k1",
+        "k2",
+        "k3",
+        "k4",
+    ]
+    assert [call.query.get("page_token") for call in api.calls] == [None, "2", "4"]
 
 
-@pytest.mark.asyncio
-async def test_store_abatch_resolve_actor_before_thread(store_factory, api):
-    """Test that abatch resolves actor before asyncio.to_thread."""
-    store = store_factory(actor="alice")
+@pytest.mark.parametrize(
+    ("filter_", "expected"),
+    [
+        ({"score": {"$gt": 15}}, ["c"]),
+        ({"score": {"$gte": 15}}, ["b", "c"]),
+        ({"score": {"$lt": 15}}, ["a"]),
+        ({"score": {"$lte": 15}}, ["a", "b"]),
+        ({"score": {"$ne": 15}}, ["a", "c", "d"]),  # "high" is not a number, but $ne still matches
+        ({"score": {"$gte": 15}, "kind": "y"}, ["c"]),  # every key must match, not any
+    ],
+    ids=["gt", "gte", "lt", "lte", "ne", "multi-key-and"],
+)
+def test_filter_operators_and_boundaries_on_search_without_query(api, filter_, expected):
+    store = _store()
+    store.put(("ns",), "a", {"score": 10, "kind": "x"})
+    store.put(("ns",), "b", {"score": 15, "kind": "x"})
+    store.put(("ns",), "c", {"score": 20, "kind": "y"})
+    store.put(("ns",), "d", {"score": "high", "kind": "y"})
 
-    ops = [
-        PutOp(namespace=("ns",), key="key1", value={"a": 1}),
-        GetOp(namespace=("ns",), key="key1"),
+    assert sorted(item.key for item in store.search(("ns",), filter=filter_)) == expected
+
+
+# --- search with a query --------------------------------------------------------
+
+
+def test_query_search_matches_whole_words_and_stays_within_the_actor(api):
+    alice, bob = _store("alice"), _store("bob")
+    alice.put(("ns",), "tea-house", {"title": "Tea House"})
+    alice.put(("ns",), "tealeaf", {"note": "tealeaf"})
+    alice.put(("ns",), "green", {"note": "green TEA"})
+    bob.put(("ns",), "bobs", {"note": "tea"})
+
+    hits = alice.search(("ns",), query="tea")
+    assert {item.key: item.score for item in hits} == {"tea-house": 1.0, "green": 1.0}
+    assert [item.key for item in bob.search(("ns",), query="tea")] == ["bobs"]
+
+
+def test_query_search_passes_the_path_prefix_so_other_namespaces_do_not_use_the_window(api):
+    for i in range(150):
+        api.seed(f"/langgraph/other/k{i}", '{"note":"tea"}')
+    api.seed("/langgraph/ns/mine", '{"note":"tea"}')
+
+    results = _store().search(("ns",), query="tea", limit=5)
+
+    assert [item.key for item in results] == ["mine"]
+    [search] = [call for call in api.calls if call.route == "search"]
+    assert search.body["path_prefix"] == "/langgraph/ns/"
+    assert search.body["page_size"] == 55  # offset + limit + 50 headroom
+
+
+def test_query_search_with_a_filter_requests_the_full_window_and_warns_when_it_is_short(
+    api, caplog
+):
+    store = _store()
+    for i in range(10):
+        store.put(("ns",), f"blue{i}", {"color": "blue", "note": "tea"})
+    for i in range(60):  # these rank first but fail the filter
+        store.put(("ns",), f"red{i}", {"color": "red", "note": "tea tea tea"})
+
+    results = store.search(("ns",), query="tea", filter={"color": "blue"}, limit=10)
+
+    assert sorted(item.key for item in results) == sorted(f"blue{i}" for i in range(10))
+    [search] = [call for call in api.calls if call.route == "search"]
+    assert search.body["page_size"] == 100
+
+    # 120 matches, none passing the filter: the window of 100 is full and the page is short.
+    for i in range(120):
+        store.put(("full",), f"red{i}", {"color": "red", "note": "tea"})
+    with caplog.at_level(logging.WARNING, logger=store_mod.logger.name):
+        assert store.search(("full",), query="tea", filter={"color": "blue"}, limit=10) == []
+    warned = [r for r in caplog.records if "reached the 100 results" in r.getMessage()]
+    assert len(warned) == 1
+
+    # 70 matches, no filter: the window of 60 covers the page, so there is nothing to warn about.
+    caplog.clear()
+    for i in range(70):
+        store.put(("quiet",), f"q{i}", {"note": "tea"})
+    with caplog.at_level(logging.WARNING, logger=store_mod.logger.name):
+        assert len(store.search(("quiet",), query="tea", limit=10)) == 10
+    assert not [r for r in caplog.records if "reached the 100 results" in r.getMessage()]
+
+
+# --- list_namespaces --------------------------------------------------------------
+
+
+def test_list_namespaces_by_prefix_suffix_and_wildcards(api):
+    store = _store()
+    for namespace in [("a", "x"), ("b", "x"), ("a", "y", "z"), ("c",)]:
+        store.put(namespace, "k", {"v": 1})
+
+    assert store.list_namespaces(prefix=("a",)) == [("a", "x"), ("a", "y", "z")]
+    assert store.list_namespaces(suffix=("x",)) == [("a", "x"), ("b", "x")]
+    assert store.list_namespaces(prefix=("*", "x")) == [("a", "x"), ("b", "x")]
+    assert store.list_namespaces(suffix=("*", "z")) == [("a", "y", "z")]
+
+
+def test_list_namespaces_truncates_depth_dedupes_and_pages(api):
+    store = _store()
+    for namespace in [("a", "b"), ("a", "b", "c"), ("a", "d")]:
+        store.put(namespace, "k", {"v": 1})
+    for i in range(5):
+        store.put(("ns", str(i)), "k", {"v": i})
+
+    assert store.list_namespaces(prefix=("a",), max_depth=1) == [("a",)]
+    assert store.list_namespaces(prefix=("a",), max_depth=2) == [("a", "b"), ("a", "d")]
+    assert store.list_namespaces(prefix=("ns",), limit=2, offset=1) == [("ns", "1"), ("ns", "2")]
+    assert store.list_namespaces(prefix=("ns",), limit=2, offset=4) == [("ns", "4")]
+
+
+# --- service handle, factory and fallback --------------------------------------------
+
+
+def test_client_is_built_once_on_first_use(api, monkeypatch):
+    built = []
+
+    class CountingClient(store_mod.AgentKitClient):
+        def __init__(self, *args, **kwargs):
+            built.append(1)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(store_mod, "AgentKitClient", CountingClient)
+    store = _store()
+    assert built == []
+
+    store.put(("ns",), "k", {"v": 1})
+    store.get(("ns",), "k")
+    store.search(("ns",))
+
+    assert built == [1]
+
+
+def test_memory_store_factory_uses_the_explicit_id_then_the_environment(api, monkeypatch):
+    monkeypatch.setenv("AGENT_MEMORY_STORE", "env-store")
+
+    store_mod.memory_store(actor="alice").put(("ns",), "k", {"v": 1})
+    store_mod.memory_store("explicit-store", actor="alice").put(("ns",), "j", {"v": 2})
+
+    creates = [call for call in api.calls if call.route == "create"]
+    assert [(call.store, call.actor_id) for call in creates] == [
+        ("env-store", "alice"),
+        ("explicit-store", "alice"),
     ]
 
-    results = await store.abatch(ops)
-    assert len(results) == 2
-    assert results[1] is not None
+
+def test_memory_store_without_a_store_is_in_process_partitioned_by_actor_and_strict(
+    monkeypatch, caplog, api
+):
+    monkeypatch.delenv("AGENT_MEMORY_STORE", raising=False)
+    with caplog.at_level(logging.WARNING, logger=store_mod.logger.name):
+        store = store_mod.memory_store()
+    assert "No memory store configured" in caplog.text
+
+    with run_as("alice"):
+        store.put(("ns",), "k", {"v": "alice"})
+    with run_as("bob"):
+        assert store.get(("ns",), "k") is None  # bob can't read alice's entry
+    with run_as("alice"):
+        item = store.get(("ns",), "k")
+        assert item is not None and item.value == {"v": "alice"}
+
+    strict = store_mod.memory_store(strict_user_key="langgraph_user_id")
+    with run_as("alice", langgraph_user_id="bob"):
+        with pytest.raises(ValueError, match="refusing to read or write another user's memory"):
+            strict.put(("ns",), "k", {"v": "x"})
+    with run_as("alice", langgraph_user_id="alice"):
+        strict.put(("ns",), "k", {"v": "strict"})
+        item = strict.get(("ns",), "k")
+        assert item is not None and item.value == {"v": "strict"}
+
+    assert api.calls == []  # the fallback never calls the service
 
 
-def test_memory_store_factory_explicit_store(monkeypatch, api):
-    """Test memory_store() factory with explicit store argument."""
-    from databricks_agentkit.langgraph.store import memory_store
+def test_value_over_the_size_cap_is_rejected_before_any_call(api):
+    store = _store()
+    overhead = len(json.dumps({"blob": ""}, separators=(",", ":")))
+    cap = store_mod._CONTENT_MAX_BYTES
 
-    store = memory_store(store=STORE, actor="alice")
-    assert store is not None
+    store.put(("ns",), "at-cap", {"blob": "x" * (cap - overhead)})
+    assert api.routes() == ["create"]
 
-
-def test_memory_store_factory_from_env(monkeypatch, api):
-    """Test memory_store() factory resolves from AGENT_MEMORY_STORE env."""
-    from databricks_agentkit.langgraph.store import memory_store
-
-    monkeypatch.setenv("AGENT_MEMORY_STORE", STORE)
-    store = memory_store(actor="alice")
-    assert store is not None
+    api.calls.clear()
+    with pytest.raises(ValueError, match="bytes as JSON"):
+        store.put(("ns",), "over", {"blob": "x" * (cap - overhead + 1)})
+    assert api.calls == []
 
 
-def test_memory_store_factory_client_injection(monkeypatch, api):
-    """Test memory_store() factory with explicit client injection."""
-    from databricks_agentkit.client import AgentKitClient
-    from databricks_agentkit.langgraph.store import DatabricksMemoryStore, memory_store
+def test_list_namespaces_ignores_namespaces_with_only_foreign_entries(api):
+    api.seed("/langgraph/ghost/fact", "User likes tea")
 
-    # Create a client instance.
-    def workspace_client():
-        api.clients_built.append(object())
-        return api.clients_built[-1]
-
-    monkeypatch.setattr("databricks_agentkit.runtime.workspace.workspace_client", workspace_client)
-
-    client = AgentKitClient(workspace_client())
-
-    # Pass it to memory_store.
-    store = memory_store(store=STORE, actor="alice", client=client)
-    assert isinstance(store, DatabricksMemoryStore)
+    assert _store().list_namespaces() == []
 
 
-def test_memory_store_factory_handle_built_once(monkeypatch, api):
-    """Test that the store handle is built once and reused."""
-    from databricks_agentkit.langgraph.store import DatabricksMemoryStore
-
-    store = DatabricksMemoryStore(store=STORE, actor="alice")
-
-    # Make two batch calls.
-    store.batch([PutOp(namespace=("ns",), key="key", value={"a": 1})])
-    store.batch([GetOp(namespace=("ns",), key="key")])
-
-    # Should have built exactly one client.
-    assert len(api.clients_built) == 1
+# --- known bugs (strict xfail: they flip to XPASS when fixed) ----------------------
 
 
-def test_store_thread_safe_handle_build(monkeypatch, api):
-    """Test that concurrent batch calls safely build the handle only once."""
-    from databricks_agentkit.langgraph.store import DatabricksMemoryStore
+@pytest.mark.xfail(
+    strict=True,
+    reason=(
+        "bug: put(value) raises NOT_FOUND when the entry is deleted between the lookup and the "
+        "update. MemoryStore._put_memory in memory_store.py retries only the create, so the "
+        "update sits outside the retry loop."
+    ),
+)
+def test_put_after_a_concurrent_delete_still_writes_the_value(api):
+    store = _store()
+    store.put(("ns",), "k", {"v": 1})
+    api.hooks["update"] = lambda name: api.entries.pop(name, None)
 
-    store = DatabricksMemoryStore(store=STORE, actor="alice")
-    results = []
+    store.put(("ns",), "k", {"v": 2})
 
-    def thread_work():
-        try:
-            store.batch([PutOp(namespace=("ns",), key="key", value={"a": 1})])
-            results.append("ok")
-        except Exception as e:
-            results.append(str(e))
-
-    threads = [threading.Thread(target=thread_work) for _ in range(5)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    # All threads should succeed, and only one client should be built.
-    assert all(r == "ok" for r in results)
-    assert len(api.clients_built) == 1
-
-
-def test_store_with_root_parameter(store_factory, api):
-    """Test that the root parameter changes the base path."""
-    store = store_factory(root="/custom-root")
-
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="key", value={"data": "value"}),
-        ]
-    )
-
-    # Verify the path includes the custom root.
-    entry = list(api.entries.values())[0]
-    assert entry["path"].startswith("/custom-root")
-
-
-def test_store_path_construction_exact(store_factory, api):
-    """Test that paths are constructed exactly per the contract."""
-    store = store_factory(root="/langgraph")
-
-    namespace = ("docs", "user123")
-    key = "report"
-
-    store.batch(
-        [
-            PutOp(namespace=namespace, key=key, value={"data": "value"}),
-        ]
-    )
-
-    # Path should be: {root}/{enc(ns_1)}/{enc(ns_2)}/{enc(key)}
-    entry = list(api.entries.values())[0]
-    expected_path = f"/langgraph/{quote('docs', safe='')}/{quote('user123', safe='')}/{quote('report', safe='')}"
-    assert entry["path"] == expected_path
-
-
-def test_store_multiple_namespace_levels(store_factory, api):
-    """Test storage and retrieval with multiple namespace levels."""
-    store = store_factory()
-
-    # Create items with varying namespace depths.
-    store.batch(
-        [
-            PutOp(namespace=("a",), key="k1", value={"v": 1}),
-            PutOp(namespace=("a", "b"), key="k2", value={"v": 2}),
-            PutOp(namespace=("a", "b", "c"), key="k3", value={"v": 3}),
-        ]
-    )
-
-    # Get each one back.
-    result = store.batch(
-        [
-            GetOp(namespace=("a",), key="k1"),
-            GetOp(namespace=("a", "b"), key="k2"),
-            GetOp(namespace=("a", "b", "c"), key="k3"),
-        ]
-    )
-
-    assert result[0].value == {"v": 1}
-    assert result[1].value == {"v": 2}
-    assert result[2].value == {"v": 3}
-
-
-def test_store_filter_operators_eq_ne(store_factory, api):
-    """Test filter operators: $eq, $ne."""
-    store = store_factory()
-
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="item1", value={"status": "active"}),
-            PutOp(namespace=("ns",), key="item2", value={"status": "inactive"}),
-        ]
-    )
-
-    # Filter with $eq.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",), filter={"status": {"$eq": "active"}}),
-        ]
-    )
-    items = result[0]
-    assert len(items) == 1
-    assert items[0].key == "item1"
-
-
-def test_store_filter_operators_gt(store_factory, api):
-    """Test filter operators: $gt, $gte, $lt, $lte."""
-    store = store_factory()
-
-    store.batch(
-        [
-            PutOp(namespace=("ns",), key="item1", value={"score": 10}),
-            PutOp(namespace=("ns",), key="item2", value={"score": 20}),
-            PutOp(namespace=("ns",), key="item3", value={"score": 30}),
-        ]
-    )
-
-    # Filter with $gt.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("ns",), filter={"score": {"$gt": 15}}),
-        ]
-    )
-    items = result[0]
-    assert len(items) == 2
-
-
-def test_store_update_via_put(store_factory, api):
-    """Test that putting to an existing key updates the value."""
-    store = store_factory()
-
-    # Put initial value.
-    store.batch([PutOp(namespace=("ns",), key="key", value={"count": 1})])
-
-    # Update it.
-    store.batch([PutOp(namespace=("ns",), key="key", value={"count": 2})])
-
-    # Get it back.
-    result = store.batch([GetOp(namespace=("ns",), key="key")])
-    assert result[0].value == {"count": 2}
-
-
-def test_store_cross_actor_isolation(store_factory, api):
-    """Test that different actors don't see each other's data."""
-    # Create store for alice.
-    alice_store = store_factory(actor="alice")
-    bob_store = store_factory(actor="bob")
-
-    # Alice puts data.
-    alice_store.batch([PutOp(namespace=("ns",), key="key", value={"owner": "alice"})])
-
-    # Bob gets nothing.
-    result = bob_store.batch([GetOp(namespace=("ns",), key="key")])
-    assert result[0] is None
-
-    # Alice gets her data.
-    result = alice_store.batch([GetOp(namespace=("ns",), key="key")])
-    assert result[0].value == {"owner": "alice"}
-
-
-def test_store_search_namespace_prefix_filtering(store_factory, api):
-    """Test that search respects namespace prefixes."""
-    store = store_factory()
-
-    # Put items in different namespaces.
-    store.batch(
-        [
-            PutOp(namespace=("docs",), key="d1", value={"type": "doc"}),
-            PutOp(namespace=("docs", "private"), key="d2", value={"type": "private"}),
-            PutOp(namespace=("images",), key="i1", value={"type": "image"}),
-        ]
-    )
-
-    # Search under docs prefix.
-    result = store.batch(
-        [
-            SearchOp(namespace_prefix=("docs",)),
-        ]
-    )
-    items = result[0]
-    assert len(items) == 2
-    assert all("docs" in item.namespace for item in items)
+    assert store.get(("ns",), "k").value == {"v": 2}

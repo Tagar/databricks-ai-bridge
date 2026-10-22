@@ -664,50 +664,86 @@ If access must be revoked, coordinate that separately with the store owner or wo
 
 ### LangGraph memory store as a BaseStore
 
-LangGraph's `BaseStore` interface lets a graph persist and retrieve facts during execution. `DatabricksMemoryStore` is a `BaseStore` backed by the managed memory store, allowing a LangGraph agent to maintain long-term memory in Databricks without a custom checkpointer or database connection. It integrates with the same memory stores used by the `memory_tools` above.
-
-Use `memory_store()` to create or reuse a `BaseStore` for your graph. It returns an in-memory store if no persistent store is configured, so your agent code works unchanged whether memory is provisioned or not:
+`memory_store()` returns a LangGraph `BaseStore` backed by the managed memory store, so a graph keeps facts across conversations without a Postgres connection. Build one store per app, once at startup, with no `actor=`, and pass it to the graph with `store=`. Each request names its user through `thread_config`:
 
 ```python
-from databricks_agentkit.langgraph import checkpointer, thread_config, memory_store
+from databricks_agentkit.langgraph import checkpointer, memory_store, thread_config
+from langchain.agents import create_agent
 
-# memory_store() resolves: store arg → AGENT_MEMORY_STORE → agent.toml binding → InMemoryStore + warning
-store = memory_store(actor=actor_id)
+store = memory_store()  # once, at startup: no actor= here
 
-# Pass it to your StateGraph or CompiledGraph
-graph = ... # your LangGraph graph definition
-agent = graph.compile(...)
+agent = create_agent(model, tools=tools, checkpointer=checkpointer(), store=store)
 
-# Within an invocation, read and write memory by key
-await store.aget(("path", "/key"))  # returns Item or None
-await store.aput(("path", "/key"), {"data": "value"})
-await store.aput(("path", "/key"), None)  # delete
+# Per request. user_id is the signed-in user, from your app's trusted identity.
+config = thread_config(session_id, actor=user_id)
+result = await agent.ainvoke({"messages": inputs}, config=config)
 ```
 
-The store is scoped by `actor` (who the memory belongs to; set from trusted application context, never from a user-supplied value — see security notes below) and by `path` (the memory's location in the graph's namespace). Read the store at the start of a turn to load memories before the LLM runs, and write during or after the turn when the agent decides to remember facts.
-
-The `actor` argument takes precedence; if omitted, it comes from the run config's `configurable` dict under the key set by `thread_config(session_id, actor)` (by default `"actor_id"`). Without an explicit actor, the store requires a running context:
+The store id resolves from the `store=` argument, then `AGENT_MEMORY_STORE`. `agentbricks deploy` sets that variable from the `[memory_store]` binding in agent.toml. Inside a node, `get_store()` returns the store the graph was compiled with:
 
 ```python
-# Explicit actor: works in any context (sync, async, main, or within an invocation)
-store = memory_store(actor="user-123")
+from langgraph.config import get_store
+from langgraph.graph import END, START, MessagesState, StateGraph
 
-# Implicit actor: requires a running LangGraph config context
-store = memory_store()  # reads actor from get_config()["configurable"]["actor_id"]
+
+async def remember(state: MessagesState) -> dict:
+    store = get_store()
+    await store.aput(("preferences",), "communication", {"style": "terse"})
+    item = await store.aget(("preferences",), "communication")  # Item or None
+    print("remembered:", item.value if item else None)
+    await store.adelete(("preferences",), "communication")  # hard delete
+    return {}
+
+
+builder = StateGraph(MessagesState)
+builder.add_node("remember", remember)
+builder.add_edge(START, "remember")
+builder.add_edge("remember", END)
+graph = builder.compile(checkpointer=checkpointer(), store=store)
+await graph.ainvoke({"messages": inputs}, config=thread_config(session_id, actor=user_id))
 ```
 
-Python 3.10 does not support `get_config()` in async code; pass `actor=` explicitly when using Python 3.10.
+Each entry is one cross-session memory at `/langgraph/<namespace>/<key>` for one actor, holding a JSON object.
 
-Limit operations at a time to one path per LangGraph invocation. The store returns a single item per `get` or `delete`, and `search` returns up to 100 results ranked by relevance over the entry's content and description — the ranking is performed by the managed-memory service and does not support client-side embeddings or custom index fields. Batch and pagination happen at the API level, not on the BaseStore surface. `list` operations cost one request per call and apply filters (limit, prefix, suffix, depth) client-side, so avoid high-volume list calls in a loop. Persistence uses last-writer-wins: concurrent writes to one path may overwrite each other. No time-to-live or expiration is supported; entries persist indefinitely unless deleted.
+**Who the actor is.** Take `actor` from the identity the app receives from the trusted ingress: the bundled UI reads the `x-forwarded-email` or `x-forwarded-user` header. Never take it from a request body field or a model-chosen value. In a deployed App, `WorkspaceClient().current_user.me()` returns the app's service principal, not the signed-in user.
 
-Strict mode lets you enforce that a request-supplied identity matches the actor your graph uses. Pass `strict_user_key="langgraph_user_id"` when creating the store; if the config has that key and it differs from the actor, the store raises an error. This is opt-in and off by default:
+**Explicit actor.** `memory_store(actor=...)` is for calls outside a LangGraph run, such as scripts and tests. Inside a run, a run for a different actor raises instead of mixing users.
+
+**No actor.** `thread_config(session_id)` without an actor uses the session id as the actor, so memories last for one conversation. The store logs a warning. Always pass the user.
+
+**No store configured.** If no store id resolves, `memory_store()` returns an in-process stand-in partitioned by actor. It keeps nothing across restarts. A deployed app must have a store bound.
+
+**LangMem namespaces.** Prefer `("memories",)`, since the actor already partitions entries. LangMem's manager default, `("memories", "{langgraph_user_id}")`, needs `langgraph_user_id` in the run config. Without it LangMem raises. In a background `ReflectionExecutor` that kills the worker thread, so later submissions never run.
 
 ```python
-# Strict mode: raises if config["configurable"]["langgraph_user_id"] != actor
-store = memory_store(actor="user-123", strict_user_key="langgraph_user_id")
+from langmem import create_manage_memory_tool
+
+manage = create_manage_memory_tool(namespace=("memories",), store=store)
+await manage.ainvoke({"action": "create", "content": "Prefers email over phone."}, config=config)
 ```
 
-> **Actor partitions data; it is not access control. The store, not the actor, is the security boundary.** Memory entries are separated by actor within a store, but the store itself is workspace-scoped and authorized at the store level: any principal that can access the store can read and write every actor's entries. There are no per-actor or per-entry access controls. For strict isolation between tenants, trust domains, or users, create a separate store per boundary and grant access with `memory_store.grant_permission(principal_id)`. A `strict_user_key` check does not authorize the operation — it only validates that a request's identity matches the actor; the workspace still needs store-level access to proceed. Always set actor from trusted application code (a service principal or signed-in user obtained from the Databricks SDK), never from a model-selected value or user-supplied field.
+**Strict mode** (`memory_store(strict_user_key="langgraph_user_id")`) requires that key in every run config, equal to the actor. A request without it raises. It is a consistency check, not authorization.
+
+**Python 3.10.** Async code may not see the run config. There, build a store per request with `memory_store(actor=user_id)` and pass that store in async code.
+
+Limits:
+
+- **Search** ranks with the managed-memory service. The public docs say it "ranks entries by relevance, combining full-text (BM25) and semantic matching over each entry's content and description." Testing saw full-text matching only, with no stemming, so a query must share words with the entry. Confirm on the live service. Client-side embeddings and `index` configs are not supported.
+- **Results.** A query returns at most 100 entries, with no pagination, and `limit` defaults to 10. `offset` slices that window, so an offset of 100 or more returns nothing. `filter` runs after ranking, so a filtered query can miss matches; the store logs a warning.
+- **Browsing.** `asearch(namespace)` with no query and `alist_namespaces()` read every entry the actor has under the root, 100 per request. Keep them out of hot paths.
+- **Writes.** `aput` is last-writer-wins and not atomic, and so are batches. An existing key costs three API calls. Deletes are hard deletes, and deleting an entry that is already gone succeeds.
+- **No TTL.** `ttl=` raises `NotImplementedError`. Each put stores a plain-text description of up to 500 characters, which search also matches.
+- **Scope.** Session-scoped entries and `memory_tools` entries (plain text at `/<topic>.md`) are invisible to the store. `memory_tools` recall searches the actor's whole store, though, so it can return JSON entries written here to the model.
+
+**The actor partitions data; it is not access control. The store is the boundary.** Calls run with the app's credentials, so any principal with store access can read every actor's entries, and any workspace user can list store names. Use a separate store per tenant or trust domain. `agentbricks deploy` grants the app's service principal access to a store declared in agent.toml. A failed grant is reported and does not fail the deploy. For a store named only in code, grant access with the app's `service_principal_client_id`:
+
+```python
+from databricks_agentkit import workspace_client
+from databricks_agentkit.client import AgentKitClient
+
+client = AgentKitClient(workspace_client())
+client.memory_stores.get("<store-id>").grant_permission("<app-client-id>")
+```
 
 ## Model and prompt upgrades (experimental)
 

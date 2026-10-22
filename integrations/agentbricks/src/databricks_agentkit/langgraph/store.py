@@ -41,10 +41,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import urllib.parse
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Iterator, Optional, Protocol
 
 from langgraph.config import get_config
 from langgraph.store.base import (
@@ -60,18 +62,21 @@ from langgraph.store.base import (
     SearchOp,
 )
 
+from databricks_agentbricks.errors import AgentCliError
 from databricks_agentkit.client import AgentKitClient
 from databricks_agentkit.runtime.tool_manifest import resolve_memory_store
 from databricks_agentkit.runtime.workspace import workspace_client
 
 if TYPE_CHECKING:
-    from databricks_agentkit.memory_store import Memory, MemoryStore
+    from databricks_agentkit.memory_store import Memory
 
 logger = logging.getLogger(__name__)
 
 _SEARCH_MAX = 100  # the service returns at most this many entries per search, with no pagination
 _SEARCH_HEADROOM = 50  # extra results requested to cover entries dropped by client-side filters
 _LIST_PAGE_SIZE = 100
+# The service rejects requests near 1 MiB, and only after a long wait, so refuse large values here.
+_CONTENT_MAX_BYTES = 900_000
 
 
 def _encode_segment(segment: str, what: str) -> str:
@@ -112,7 +117,10 @@ def _value(memory: Memory) -> Optional[dict[str, Any]]:
 
 
 def _compare_values(item_value: Any, filter_value: Any) -> bool:
-    """Filter matching with InMemoryStore semantics ($eq/$ne/$gt/$gte/$lt/$lte, nested dicts)."""
+    """Filter matching with InMemoryStore semantics ($eq/$ne/$gt/$gte/$lt/$lte, nested dicts).
+
+    Adapted from ``_compare_values`` in ``langgraph.store.memory`` (MIT, LangChain, Inc.).
+    """
     if isinstance(filter_value, dict):
         if any(k.startswith("$") for k in filter_value):
             return all(
@@ -167,16 +175,122 @@ def _matches_condition(namespace: tuple[str, ...], condition: MatchCondition) ->
     return all(p == "*" or p == label for p, label in zip(pattern, window, strict=True))
 
 
+class _Memories(Protocol):
+    """What the store needs from a managed memory store handle (``MemoryStore``)."""
+
+    def put(
+        self, *, actor_id: str, path: str, content: str, description: Optional[str] = None
+    ) -> Any: ...
+
+    def list(
+        self,
+        *,
+        actor_id: str,
+        path: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ) -> Iterable[Any]: ...
+
+    def search(
+        self,
+        *,
+        actor_id: str,
+        query: str,
+        limit: Optional[int] = None,
+        path_prefix: Optional[str] = None,
+    ) -> Iterable[Any]: ...
+
+
+@dataclass
+class _LocalMemory:
+    path: str
+    content: str
+    create_time: datetime
+    update_time: datetime
+    _entries: dict[tuple[str, str], _LocalMemory] = field(repr=False)
+    _key: tuple[str, str] = field(repr=False)
+    session_id: Optional[str] = None
+
+    def delete(self) -> None:
+        self._entries.pop(self._key, None)
+
+
+@dataclass
+class _LocalResult:
+    memory: _LocalMemory
+    score: float
+
+
+class _LocalMemories:
+    """An in-process stand-in for a managed memory store, for local development only.
+
+    Same actor partitioning and paths as the service; search ranks by shared words.
+    """
+
+    def __init__(self) -> None:
+        self._entries: dict[tuple[str, str], _LocalMemory] = {}
+        self._lock = threading.Lock()
+
+    def put(
+        self, *, actor_id: str, path: str, content: str, description: Optional[str] = None
+    ) -> _LocalMemory:
+        now = datetime.now(timezone.utc)
+        key = (actor_id, path)
+        with self._lock:
+            old = self._entries.get(key)
+            memory = _LocalMemory(
+                path, content, old.create_time if old else now, now, self._entries, key
+            )
+            self._entries[key] = memory
+        return memory
+
+    def list(
+        self,
+        *,
+        actor_id: str,
+        path: Optional[str] = None,
+        path_prefix: Optional[str] = None,
+        page_size: Optional[int] = None,
+    ) -> list[_LocalMemory]:
+        with self._lock:
+            entries = [m for (a, _), m in self._entries.items() if a == actor_id]
+        return [
+            m
+            for m in entries
+            if (path is None or m.path == path)
+            and (path_prefix is None or m.path.startswith(path_prefix))
+        ]
+
+    def search(
+        self,
+        *,
+        actor_id: str,
+        query: str,
+        limit: Optional[int] = None,
+        path_prefix: Optional[str] = None,
+    ) -> list[_LocalResult]:
+        terms = set(re.findall(r"\w+", query.lower()))
+        hits = []
+        for memory in self.list(actor_id=actor_id, path_prefix=path_prefix):
+            score = len(terms & set(re.findall(r"\w+", memory.content.lower())))
+            if score:
+                hits.append(_LocalResult(memory, float(score)))
+        hits.sort(key=lambda r: -r.score)
+        return hits[:limit]
+
+
 class DatabricksMemoryStore(BaseStore):
     """LangGraph ``BaseStore`` on an Agent Bricks managed memory store.
 
     Args:
-        store: Memory store id. Resolves ``store`` → ``AGENT_MEMORY_STORE`` → the
-            ``[memory_store]`` binding in agent.toml; with none, the first call raises.
-        actor: The identity whose memories to use. Omit it to read
-            ``configurable[actor_key]`` from each call's run config (see ``thread_config``).
+        store: Memory store id. Resolves ``store`` → ``AGENT_MEMORY_STORE`` (which
+            ``agentbricks dev`` and deployed Apps set from the agent.toml binding); with none,
+            the first call raises.
+        actor: The identity whose memories to use, for calls outside a LangGraph run. Inside a
+            run the actor comes from ``configurable[actor_key]`` (see ``thread_config``); a run
+            for a different actor than ``actor`` raises rather than mixing users.
         actor_key: The run-config key holding the actor.
-        strict_user_key: Optional run-config key that must equal the actor when present, eg
+        strict_user_key: Optional run-config key that must be present and equal the actor, eg
             ``"langgraph_user_id"`` for LangMem namespaces templated on the user id.
         root: Path prefix for this store's entries, so they don't mix with other writers.
         client: An AgentKit client; built from the workspace client on first use when omitted.
@@ -204,8 +318,14 @@ class DatabricksMemoryStore(BaseStore):
         self._strict_user_key = strict_user_key
         self._root = root
         self._client = client
-        self._handle: Optional[MemoryStore] = None
+        self._handle: Optional[_Memories] = None
         self._lock = threading.Lock()
+
+    @classmethod
+    def _local(cls, **kwargs: Any) -> DatabricksMemoryStore:
+        store = cls("local", **kwargs)
+        store._handle = _LocalMemories()
+        return store
 
     def batch(self, ops: Iterable[Op]) -> list[Result]:
         return self._run(list(ops), self._resolve_actor())
@@ -223,29 +343,47 @@ class DatabricksMemoryStore(BaseStore):
         try:
             configurable = get_config().get("configurable", {})
         except RuntimeError as e:
-            if self._actor is not None:
-                return self._actor  # no run config to check strict mode against
+            if self._actor is not None and self._strict_user_key is None:
+                return self._actor  # called outside a LangGraph run
             raise ValueError(
-                "DatabricksMemoryStore needs an actor: call it inside a LangGraph run with "
-                "config=thread_config(session_id, actor), or pass actor=. Async code on "
-                "Python 3.10 can't read the run config, so it must pass actor=."
+                "DatabricksMemoryStore needs a run config: call it inside a LangGraph run with "
+                "config=thread_config(session_id, actor), or pass actor= for calls outside one. "
+                "Threads you start yourself don't inherit the run config (copy it with "
+                "contextvars.copy_context()), and async code on Python 3.10 may not see it."
             ) from e
-        actor = self._actor if self._actor is not None else configurable.get(self._actor_key)
+        run_actor = configurable.get(self._actor_key)
+        # thread_config(session_id) without an actor sets the actor to the session id.
+        defaulted = run_actor is not None and run_actor == configurable.get("thread_id")
+        if self._actor is None:
+            actor = run_actor
+            if defaulted:
+                _warn_once(
+                    "The run config's actor is the session id, so memories won't carry over to "
+                    "other conversations; pass the user to thread_config(session_id, actor)."
+                )
+        else:
+            actor = self._actor
+            if run_actor is not None and not defaulted and run_actor != actor:
+                raise ValueError(
+                    f"This DatabricksMemoryStore was built for actor {actor!r} but the run is for "
+                    f"{run_actor!r}. Build one store without actor= and pass each user through "
+                    "thread_config(session_id, actor)."
+                )
         if not actor:
             raise ValueError(
                 f"DatabricksMemoryStore needs an actor: the run config has no "
-                f"{self._actor_key!r}. Use config=thread_config(session_id, actor) or pass actor=."
+                f"{self._actor_key!r}. Use config=thread_config(session_id, actor)."
             )
         if self._strict_user_key is not None:
             user = configurable.get(self._strict_user_key)
-            if user is not None and user != actor:
+            if user != actor:
                 raise ValueError(
                     f"Run config {self._strict_user_key!r}={user!r} doesn't match actor {actor!r}; "
                     "refusing to read or write another user's memory."
                 )
         return actor
 
-    def _memory_store(self) -> MemoryStore:
+    def _memory_store(self) -> _Memories:
         # Built on first use and reused: the client resolves workspace auth, and the id-only
         # handle avoids fetching the store before every call.
         with self._lock:
@@ -260,7 +398,7 @@ class DatabricksMemoryStore(BaseStore):
                 self._handle = client.memory_stores._handle(store_id)
             return self._handle
 
-    def _apply(self, handle: MemoryStore, actor: str, op: Op) -> Result:
+    def _apply(self, handle: _Memories, actor: str, op: Op) -> Result:
         if isinstance(op, GetOp):
             return self._get(handle, actor, op)
         if isinstance(op, PutOp):
@@ -271,24 +409,24 @@ class DatabricksMemoryStore(BaseStore):
             return self._list_namespaces(handle, actor, op)
         raise TypeError(f"Unsupported store operation: {type(op).__name__}")
 
-    def _at(self, handle: MemoryStore, actor: str, path: str) -> list[Memory]:
+    def _at(self, handle: _Memories, actor: str, path: str) -> list[Memory]:
         # The API ignores session_id alongside path, so recheck both.
         listed = handle.list(actor_id=actor, path=path, page_size=_LIST_PAGE_SIZE)
         return [m for m in listed if m.path == path and m.session_id is None]
 
-    def _under(self, handle: MemoryStore, actor: str, prefix: str) -> Iterator[Memory]:
+    def _under(self, handle: _Memories, actor: str, prefix: str) -> Iterator[Memory]:
         for memory in handle.list(actor_id=actor, path_prefix=prefix, page_size=_LIST_PAGE_SIZE):
             if memory.session_id is None and memory.path.startswith(prefix):
                 yield memory
 
-    def _get(self, handle: MemoryStore, actor: str, op: GetOp) -> Optional[Item]:
+    def _get(self, handle: _Memories, actor: str, op: GetOp) -> Optional[Item]:
         for memory in self._at(handle, actor, _item_path(self._root, op.namespace, op.key)):
             value = _value(memory)
             if value is not None:
                 return Item(value=value, key=op.key, namespace=op.namespace, **_times(memory))
         return None
 
-    def _put(self, handle: MemoryStore, actor: str, op: PutOp) -> None:
+    def _put(self, handle: _Memories, actor: str, op: PutOp) -> None:
         if op.ttl is not None:
             raise NotImplementedError("DatabricksMemoryStore doesn't support TTL (ttl=).")
         if isinstance(op.index, list):
@@ -299,16 +437,29 @@ class DatabricksMemoryStore(BaseStore):
         path = _item_path(self._root, op.namespace, op.key)
         if op.value is None:
             for memory in self._at(handle, actor, path):
-                memory.delete()
+                try:
+                    memory.delete()
+                except AgentCliError as e:
+                    if e.error_code != "NOT_FOUND":  # already gone, eg a retried delete
+                        raise
             return
         content = json.dumps(op.value, ensure_ascii=False, separators=(",", ":"))
-        handle.put(actor_id=actor, path=path, content=content)
+        if len(content.encode()) > _CONTENT_MAX_BYTES:
+            raise ValueError(
+                f"Value for key {op.key!r} is {len(content.encode()):,} bytes as JSON; managed memory "
+                f"entries must stay under about {_CONTENT_MAX_BYTES:,} bytes."
+            )
+        handle.put(actor_id=actor, path=path, content=content, description=_describe(op.value))
 
-    def _search(self, handle: MemoryStore, actor: str, op: SearchOp) -> list[SearchItem]:
+    def _search(self, handle: _Memories, actor: str, op: SearchOp) -> list[SearchItem]:
         prefix = _prefix_path(self._root, op.namespace_prefix)
         if op.query:
-            limit = min(_SEARCH_MAX, op.offset + op.limit + _SEARCH_HEADROOM)
-            found = handle.search(actor_id=actor, query=op.query, limit=limit, path_prefix=prefix)
+            # A filter runs after the service ranks, so ask for the most it returns.
+            want = op.offset + op.limit + _SEARCH_HEADROOM
+            limit = _SEARCH_MAX if op.filter else min(_SEARCH_MAX, want)
+            found = list(
+                handle.search(actor_id=actor, query=op.query, limit=limit, path_prefix=prefix)
+            )
             candidates = [(r.memory, r.score) for r in found]
         else:
             candidates = [(m, None) for m in self._under(handle, actor, prefix)]
@@ -321,15 +472,22 @@ class DatabricksMemoryStore(BaseStore):
                 continue
             namespace, key = parts
             items.append(SearchItem(namespace, key, value, score=score, **_times(memory)))
+        if op.query and len(found) >= limit and len(items) < op.offset + op.limit:
+            logger.warning(
+                "search(%r) reached the %d results managed memory returns per query; matches "
+                "ranked lower aren't seen, so this page may be short. Narrow the namespace or query.",
+                op.query,
+                limit,
+            )
         return items[op.offset : op.offset + op.limit]
 
     def _list_namespaces(
-        self, handle: MemoryStore, actor: str, op: ListNamespacesOp
+        self, handle: _Memories, actor: str, op: ListNamespacesOp
     ) -> list[tuple[str, ...]]:
         namespaces = set()
         for memory in self._under(handle, actor, self._root + "/"):
             parts = _split_path(self._root, memory.path)
-            if parts is None:
+            if parts is None or _value(memory) is None:  # same entries get and search see
                 continue
             namespace = parts[0]
             if op.match_conditions and not all(
@@ -340,29 +498,57 @@ class DatabricksMemoryStore(BaseStore):
         return sorted(namespaces)[op.offset : op.offset + op.limit]
 
 
-def _times(memory: Memory) -> dict[str, datetime]:
+_DESCRIPTION_MAX = 500
+
+
+def _describe(value: dict[str, Any]) -> str:
+    """The value's text, for the CLI and UI listings and the service's search over descriptions."""
+    texts: list[str] = []
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            texts.append(node)
+        elif isinstance(node, dict):
+            for child in node.values():
+                walk(child)
+        elif isinstance(node, (list, tuple)):
+            for child in node:
+                walk(child)
+
+    walk(value)
+    return " ".join(" ".join(texts).split())[:_DESCRIPTION_MAX]
+
+
+_warned: set[str] = set()
+
+
+def _warn_once(message: str) -> None:
+    if message not in _warned:
+        _warned.add(message)
+        logger.warning(message)
+
+
+def _times(memory: Any) -> dict[str, datetime]:
     now = datetime.now(timezone.utc)
     return {"created_at": memory.create_time or now, "updated_at": memory.update_time or now}
 
 
 def memory_store(
-    store: Optional[str] = None, *, actor: Optional[str] = None, **kwargs
+    store: Optional[str] = None, *, actor: Optional[str] = None, **kwargs: Any
 ) -> BaseStore:
-    """The LangGraph long-term memory store: managed memory when a store is configured.
+    """The LangGraph long-term memory store on managed memory. Build it once and reuse it.
 
-    Resolves ``store`` → ``AGENT_MEMORY_STORE`` → the ``[memory_store]`` binding in agent.toml.
-    With none, returns LangGraph's ``InMemoryStore`` and logs a warning: fine for local
-    development, but it keeps nothing across restarts and doesn't partition by actor.
+    Resolves ``store`` → ``AGENT_MEMORY_STORE`` (set by ``agentbricks dev`` and deployed Apps from
+    the agent.toml binding). With none, logs a warning and returns an in-process stand-in with
+    the same actor partitioning, for local development: it keeps nothing across restarts.
     ``actor`` and ``kwargs`` go to :class:`DatabricksMemoryStore`.
     """
     store_id = resolve_memory_store(store)
     if not store_id:
-        from langgraph.store.memory import InMemoryStore
-
-        logger.warning(
+        _warn_once(
             "No memory store configured (pass store=, set AGENT_MEMORY_STORE, or run "
-            "`agentbricks memory bind`); using an in-process InMemoryStore that keeps nothing "
-            "across restarts and doesn't partition memories by actor."
+            "`agentbricks memory bind`); using an in-process store that keeps nothing across "
+            "restarts."
         )
-        return InMemoryStore()
+        return DatabricksMemoryStore._local(actor=actor, **kwargs)
     return DatabricksMemoryStore(store_id, actor=actor, **kwargs)
