@@ -10,7 +10,7 @@ This guide covers moving an agent from the legacy `DatabricksStore` in `databric
 ## Before you start
 
 - Review the limits in the [LangGraph memory store section](README.md#langgraph-memory-store-as-a-basestore) of the README: the 100-entry search window, last-writer-wins writes, and no TTL.
-- **Recall gets weaker.** The legacy store ranks by embeddings (`embedding_endpoint`). The managed store ranks with the service's full-text matching over content and description. Queries must share words with the stored text, and there is no stemming. The managed store has no client-side embeddings and no custom index fields. If you need embedding search, stay on `DatabricksStore`. Measure recall on your own data before cutover.
+- **Recall may change.** The legacy store ranks by your own embedding endpoint (`embedding_endpoint`). The managed store ranks with the service, which the docs describe as combining full-text (BM25) and semantic matching over content and description. In testing, some workspaces matched on meaning and others only on shared words, so measure recall on your own data and workspace before cutover. The managed store has no client-side embeddings and no custom index fields; if you need to control the embedding model, stay on `DatabricksStore`.
 - Existing memories are not migrated. Decide before cutover whether to script a copy or accept the loss.
 
 ## Migration steps

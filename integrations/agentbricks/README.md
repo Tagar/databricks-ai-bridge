@@ -728,7 +728,7 @@ await manage.ainvoke({"action": "create", "content": "Prefers email over phone."
 
 Limits:
 
-- **Search** ranks with the managed-memory service. The public docs say it "ranks entries by relevance, combining full-text (BM25) and semantic matching over each entry's content and description." Testing saw full-text matching only, with no stemming, so a query must share words with the entry. Confirm on the live service. Client-side embeddings and `index` configs are not supported.
+- **Search** ranks with the managed-memory service. The public docs say it "ranks entries by relevance, combining full-text (BM25) and semantic matching over each entry's content and description." In testing, semantic matching was available in some workspaces and not yet in others, where a query had to share words with the entry; check yours. Client-side embeddings and `index` configs are not supported.
 - **Results.** A query returns at most 100 entries, with no pagination, and `limit` defaults to 10. `offset` slices that window, so an offset of 100 or more returns nothing. `filter` runs after ranking, so a filtered query can miss matches; the store logs a warning.
 - **Browsing.** `asearch(namespace)` with no query and `alist_namespaces()` read every entry the actor has under the root, 100 per request. Keep them out of hot paths.
 - **Writes.** `aput` is last-writer-wins and not atomic, and so are batches. An existing key costs three API calls. Deletes are hard deletes, and deleting an entry that is already gone succeeds.

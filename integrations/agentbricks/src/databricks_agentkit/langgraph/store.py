@@ -25,8 +25,8 @@ outside ``root``, saved under a session, or not holding a JSON object (for examp
 facts ``memory_tools`` writes) are ignored.
 
 Limits:
-  - Search ranking is the service's (full-text over each entry's content and description); there
-    are no client-side embeddings, so ``index`` configs and per-item ``index`` field lists are
+  - Search ranking is the service's (full-text and, where available, semantic matching over each
+    entry's content and description); there are no client-side embeddings, so ``index`` configs and per-item ``index`` field lists are
     rejected. One search returns at most 100 entries, so ``offset + limit`` beyond what the service
     returns comes back short.
   - No TTL.
