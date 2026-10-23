@@ -703,7 +703,13 @@ graph = builder.compile(checkpointer=checkpointer(), store=store)
 await graph.ainvoke({"messages": inputs}, config=thread_config(session_id, actor=user_id))
 ```
 
-Each entry is one cross-session memory at `/langgraph/<namespace>/<key>` for one actor, holding a JSON object.
+Each item is one cross-session memory at `/langgraph/<namespace>/<key>`, holding the value in a small JSON envelope (`{"lg": 1, "v": <value>}`, plus `"x"`, the expiry in epoch milliseconds, when the item has a TTL).
+
+**Storage actor.** Entries are kept under `<actor>:langgraph`, not the plain actor. Memory pipelines process only actors that have sessions, and no session uses that id, so a pipeline on the same memory store leaves these entries alone. Sessions and `memory_tools` use the plain actor, so they don't see them either. An actor that itself ends with `:langgraph` is refused, by the store, `thread_config` and `memory_tools`, so no user can share another user's entries. `DatabricksMemoryStore.storage_actor(user_id)` returns the id. To look at a user's entries with the CLI:
+
+```bash
+agentbricks memory entries list --store <store-id> --actor-id "<user-id>:langgraph" --path-prefix /langgraph/ -o json
+```
 
 **Who the actor is.** Take `actor` from the identity the app receives from the trusted ingress: the bundled UI reads the `x-forwarded-email` or `x-forwarded-user` header. Never take it from a request body field or a model-chosen value. In a deployed App, `WorkspaceClient().current_user.me()` returns the app's service principal, not the signed-in user.
 
@@ -728,12 +734,26 @@ await manage.ainvoke({"action": "create", "content": "Prefers email over phone."
 
 Limits:
 
-- **Search** ranks with the managed-memory service. The public docs say it "ranks entries by relevance, combining full-text (BM25) and semantic matching over each entry's content and description." In testing, semantic matching was available in some workspaces and not yet in others, where a query had to share words with the entry; check yours. Client-side embeddings and `index` configs are not supported.
-- **Results.** A query returns at most 100 entries, with no pagination, and `limit` defaults to 10. `offset` slices that window, so an offset of 100 or more returns nothing. `filter` runs after ranking, so a filtered query can miss matches; the store logs a warning.
-- **Browsing.** `asearch(namespace)` with no query and `alist_namespaces()` read every entry the actor has under the root, 100 per request. Keep them out of hot paths.
-- **Writes.** `aput` is last-writer-wins and not atomic, and so are batches. An existing key costs three API calls. Deletes are hard deletes, and deleting an entry that is already gone succeeds.
-- **No TTL.** `ttl=` raises `NotImplementedError`. Each put stores a plain-text description of up to 500 characters, which search also matches.
-- **Scope.** Session-scoped entries and `memory_tools` entries (plain text at `/<topic>.md`) are invisible to the store. `memory_tools` recall searches the actor's whole store, though, so it can return JSON entries written here to the model.
+- **Search** ranks with the managed-memory service. The public docs say it "ranks entries by relevance, combining full-text (BM25) and semantic matching over each entry's content and description." Semantic matching is enabled by the service and may not be on in every workspace yet; without it, a query has to share words with the entry. The response doesn't say which ran (see the check below). Scores are the service's: higher is better, and the scale depends on which matching ran. Client-side embeddings and `index` configs are not supported.
+- **Results.** A query returns at most 100 entries, with no pagination, and `limit` defaults to 10. `offset` slices that window, so an offset of 100 or more returns nothing. `filter` runs after ranking, so a filtered query can miss matches; the store logs a warning. With semantic matching, a query can return entries that share no words with it, so a narrow namespace matters: entries ranked below the first 100 can't be reached by search.
+- **Browsing.** `asearch(namespace)` with no query and `alist_namespaces()` read every entry under the namespace prefix, 100 per request. Keep them out of hot paths.
+- **Writes.** `aput` is last-writer-wins and not atomic, and so are batches. An existing key costs three API calls. Deletes are hard deletes, and deleting an entry that is already gone succeeds. A put can raise `ABORTED` when another writer changes the same key at once; retry it. Cancelling an async call doesn't stop a write that was already sent, and the SDK retries transient errors for up to five minutes before a call fails. Each put also stores a plain-text description of up to 500 characters, which search also matches.
+- **Scope.** Session-scoped entries, `memory_tools` entries and memory-pipeline entries are under the plain actor, so the store never sees them, and they never see the store's.
+
+**TTL.** `aput(..., ttl=minutes)`, or `memory_store(ttl={"default_ttl": minutes})` for puts that don't pass `ttl=`, sets an expiry, as LangGraph's Postgres store does. The differences:
+
+- A TTL counts from the last write. Reads don't refresh it: `refresh_on_read=True` raises, because a refresh would rewrite the entry and could undo a concurrent put.
+- Expired items are never returned (`omit_expired` defaults to True), but they stay in the service until they are overwritten or swept. Until then they count toward the 100-result search window, and `memory_tools`, the CLI and the UI can still list them. The memory service has no expiry of its own.
+- There's no background sweeper, because the memory API lists one actor at a time: `sweep_interval_minutes` raises. Call `store.sweep_ttl(actor=user_id)` (or `asweep_ttl`) to delete one user's expired items, for example after a request or from a scheduled job.
+- Expiry uses the app's clock, so keep hosts NTP-synced; a TTL under a minute is sensitive to clock skew. A put without a TTL clears an earlier one.
+
+**Checking whether a workspace has semantic matching.** The response doesn't say, so test it with a throwaway store:
+
+1. Write two entries under one test actor: "Prefers to be contacted by email rather than phone." and "Allergic to peanuts."
+2. Wait about 20 seconds, then search "electronic mail correspondence", which shares no word with either entry. If the email entry comes back first, semantic matching is on. An empty result means full-text matching only.
+3. Delete the test store.
+
+The gated live test `tests/suites/test_langgraph_store.py::test_search_mode` runs the same check.
 
 **The actor partitions data; it is not access control. The store is the boundary.** Calls run with the app's credentials, so any principal with store access can read every actor's entries, and any workspace user can list store names. Use a separate store per tenant or trust domain. `agentbricks deploy` grants the app's service principal access to a store declared in agent.toml. A failed grant is reported and does not fail the deploy. For a store named only in code, grant access with the app's `service_principal_client_id`:
 

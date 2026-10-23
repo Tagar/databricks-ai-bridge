@@ -92,7 +92,7 @@ class FakeMemoryApi:
         path: str,
         content: Optional[str],
         *,
-        actor_id: str = "alice",
+        actor_id: str = "alice:langgraph",  # the store's storage actor for "alice"
         session_id: Optional[str] = None,
         description: Optional[str] = None,
         store: str = STORE,

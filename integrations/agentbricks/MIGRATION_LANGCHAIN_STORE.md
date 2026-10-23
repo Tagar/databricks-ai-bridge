@@ -9,8 +9,8 @@ This guide covers moving an agent from the legacy `DatabricksStore` in `databric
 
 ## Before you start
 
-- Review the limits in the [LangGraph memory store section](README.md#langgraph-memory-store-as-a-basestore) of the README: the 100-entry search window, last-writer-wins writes, and no TTL.
-- **Recall may change.** The legacy store ranks by your own embedding endpoint (`embedding_endpoint`). The managed store ranks with the service, which the docs describe as combining full-text (BM25) and semantic matching over content and description. In testing, some workspaces matched on meaning and others only on shared words, so measure recall on your own data and workspace before cutover. The managed store has no client-side embeddings and no custom index fields; if you need to control the embedding model, stay on `DatabricksStore`.
+- Review the limits in the [LangGraph memory store section](README.md#langgraph-memory-store-as-a-basestore) of the README: the 100-entry search window, last-writer-wins writes, and TTL that counts from the last write and is never refreshed by reads.
+- **Recall may change.** The legacy store ranks by your own embedding endpoint (`embedding_endpoint`). The managed store ranks with the service, which the docs describe as combining full-text (BM25) and semantic matching over content and description. Semantic matching may not be on in every workspace yet, so check yours (the README has a short check) and measure recall on your own data before cutover. The managed store has no client-side embeddings and no custom index fields; if you need to control the embedding model, stay on `DatabricksStore`.
 - Existing memories are not migrated. Decide before cutover whether to script a copy or accept the loss.
 
 ## Migration steps
@@ -121,14 +121,14 @@ Deploy creates the declared store and grants the app's service principal access.
 
 ## Data migration
 
-Memories in the legacy `DatabricksStore` table and in the managed store are not compatible, and nothing copies them for you. There is no export or import command. `agentbricks memory entries` writes one entry at a time with a hand-built path, so it is not a bulk copy route.
+Memories in the legacy `DatabricksStore` table and in the managed store are not compatible, and nothing copies them for you. There is no export or import command. `agentbricks memory entries` writes one entry at a time with a hand-built path, actor and envelope, so it is not a bulk copy route; an entry it writes is read by the store only if it uses the storage actor (`<user-id>:langgraph`) and the store's envelope.
 
 If old memories matter, script a one-time copy:
 
 1. **Export read-only.** Connect to the legacy Lakebase with a read-only role. Read the store table's prefix, key, value, and timestamp columns. Check the column names against your schema first. Write the export to a private directory, outside the repo.
 2. **Map rows to actors.** The namespace is the prefix split on dots, unchanged, so existing `aget` and `asearch` calls still hit the same tuples. The legacy table has no actor column, so use a mapping file that says which label is the user id. Rows with no matching rule go to a report, not the store.
-3. **Decide per row.** Skip expired rows. Rows with a TTL become permanent in the managed store, because it has no TTL, so skip them unless you accept that. Skip non-object values, since the store holds JSON objects only.
-4. **Write through the public API.** Write each row with a store pinned to its mapped actor. A script may pin an actor outside a run:
+3. **Decide per row.** Skip expired rows. For a row with a TTL, pass `ttl=` with its remaining minutes, or skip it. Skip non-object values, since the store holds JSON objects only.
+4. **Write through the public API.** Write each row with a store pinned to its mapped actor. A script may pin an actor outside a run. The store writes under the storage actor `<actor>:langgraph`, so a CLI check (step 6) must use that id too:
 
 ```python
 from databricks_agentkit.langgraph import memory_store

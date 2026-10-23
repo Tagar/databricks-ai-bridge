@@ -5,7 +5,6 @@ the workspace transport is faked (``_memory_api_fake``). Run-config and graph be
 ``langgraph_store_graph_test.py``.
 """
 
-import json
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
@@ -29,6 +28,11 @@ def api(monkeypatch):
 
 def _store(actor="alice", **kwargs):
     return store_mod.DatabricksMemoryStore(store=STORE, actor=actor, **kwargs)
+
+
+def _env(value, expires_at_ms=None):
+    """An entry's content as the store writes it."""
+    return store_mod._wrap(value, expires_at_ms)
 
 
 @contextmanager
@@ -77,8 +81,9 @@ def test_rejected_inputs_raise_without_touching_the_service(api):
         _store().put(("ns",), "", {"v": 1})
     with pytest.raises(ValueError, match="root must start with"):
         store_mod.DatabricksMemoryStore(store=STORE, actor="alice", root="/x/")
-    with pytest.raises(NotImplementedError, match="TTL"):
-        _store().put(("ns",), "k", {"v": 1}, ttl=5.0)
+    for ttl in (0, -1, True, "5"):
+        with pytest.raises(ValueError, match="ttl must be a positive number of minutes"):
+            _store().put(("ns",), "k", {"v": 1}, ttl=ttl)
     with pytest.raises(NotImplementedError, match="index"):
         _store().put(("ns",), "k", {"v": 1}, index=["text"])
     assert api.calls == []
@@ -93,7 +98,9 @@ def test_put_get_and_overwrite_take_the_create_conflict_then_update_path(api):
     item = store.get(("ns",), "k")
 
     assert (item.namespace, item.key, item.value) == (("ns",), "k", {"msg": "héllo", "n": 1})
-    assert api.rows()[0]["content"] == '{"msg":"héllo","n":1}'
+    [row] = api.rows()
+    assert row["content"] == '{"lg":1,"v":{"msg":"héllo","n":1}}'
+    assert row["actor_id"] == "alice:langgraph"
 
     api.calls.clear()
     store.put(("ns",), "k", {"msg": "v2"})
@@ -159,7 +166,7 @@ def test_delete_treats_not_found_as_done_and_propagates_other_errors(
 def test_item_times_come_from_the_server(api):
     api.seed(
         "/langgraph/ns/k",
-        '{"v":1}',
+        _env({"v": 1}),
         create_time="2026-01-02T03:04:05.000000Z",
         update_time="2026-02-03T04:05:06.000000Z",
     )
@@ -175,19 +182,27 @@ def test_item_times_come_from_the_server(api):
 @pytest.mark.parametrize("ignore_filters", [False, True], ids=["server-filters", "server-ignores"])
 def test_session_foreign_and_non_object_entries_are_invisible(api, ignore_filters):
     api.ignore_filters = ignore_filters
-    api.seed("/langgraph/ns/k", '{"color":"tea"}')
-    api.seed("/langgraph/ns/sess", '{"color":"tea"}', session_id="s1")
-    api.seed("/langgraph/ns/fact", "User likes tea")  # a plain-text fact from memory_tools
+    tea = _env({"color": "tea"})
+    api.seed("/langgraph/ns/k", tea)
+    api.seed("/langgraph/ns/sess", tea, session_id="s1")
+    api.seed("/langgraph/ns/fact", "User likes tea")  # plain text, eg rewritten by a pipeline
+    api.seed("/langgraph/ns/bare", '{"color":"tea"}')  # a JSON object without the envelope
     api.seed("/langgraph/ns/arr", '["tea"]')
     api.seed("/langgraph/ns/num", "1")
     api.seed("/langgraph/ns/empty", None)
-    api.seed("/other/ns/x", '{"color":"tea"}')  # outside the store's root
-    api.seed("/langgraph/sessonly/x", '{"color":"tea"}', session_id="s1")  # only a session
+    api.seed("/langgraph/ns/extra", '{"lg":1,"v":{"color":"tea"},"note":"tea"}')
+    api.seed("/langgraph/ns/badx", '{"lg":1,"v":{"color":"tea"},"x":"soon"}')
+    api.seed("/langgraph/ns/boolv", '{"lg":true,"v":{"color":"tea"}}')
+    api.seed("/langgraph/ns/deep", "[" * 200_000 + "]" * 200_000)  # json.loads recursion
+    api.seed("/other/ns/x", tea)  # outside the store's root
+    api.seed("/langgraph/sessonly/x", tea, session_id="s1")  # only a session
+    api.seed("/langgraph/ns/plain", tea, actor_id="alice")  # the plain actor: not the store's
     store = _store()
 
     assert store.get(("ns",), "k").value == {"color": "tea"}
-    for hidden in ("sess", "fact", "arr", "num", "empty"):
-        assert store.get(("ns",), hidden) is None
+    hidden = ("sess", "fact", "bare", "arr", "num", "empty", "extra", "badx", "boolv", "deep")
+    for key in hidden + ("plain",):
+        assert store.get(("ns",), key) is None
     assert [item.key for item in store.search(("ns",))] == ["k"]
     assert [item.key for item in store.search(("ns",), query="tea")] == ["k"]
     assert store.list_namespaces() == [("ns",)]
@@ -274,8 +289,8 @@ def test_query_search_matches_whole_words_and_stays_within_the_actor(api):
 
 def test_query_search_passes_the_path_prefix_so_other_namespaces_do_not_use_the_window(api):
     for i in range(150):
-        api.seed(f"/langgraph/other/k{i}", '{"note":"tea"}')
-    api.seed("/langgraph/ns/mine", '{"note":"tea"}')
+        api.seed(f"/langgraph/other/k{i}", _env({"note": "tea"}))
+    api.seed("/langgraph/ns/mine", _env({"note": "tea"}))
 
     results = _store().search(("ns",), query="tea", limit=5)
 
@@ -305,7 +320,7 @@ def test_query_search_with_a_filter_requests_the_full_window_and_warns_when_it_i
         store.put(("full",), f"red{i}", {"color": "red", "note": "tea"})
     with caplog.at_level(logging.WARNING, logger=store_mod.logger.name):
         assert store.search(("full",), query="tea", filter={"color": "blue"}, limit=10) == []
-    warned = [r for r in caplog.records if "reached the 100 results" in r.getMessage()]
+    warned = [r for r in caplog.records if "reached the most results" in r.getMessage()]
     assert len(warned) == 1
 
     # 70 matches, no filter: the window of 60 covers the page, so there is nothing to warn about.
@@ -314,7 +329,7 @@ def test_query_search_with_a_filter_requests_the_full_window_and_warns_when_it_i
         store.put(("quiet",), f"q{i}", {"note": "tea"})
     with caplog.at_level(logging.WARNING, logger=store_mod.logger.name):
         assert len(store.search(("quiet",), query="tea", limit=10)) == 10
-    assert not [r for r in caplog.records if "reached the 100 results" in r.getMessage()]
+    assert not [r for r in caplog.records if "reached the most results" in r.getMessage()]
 
 
 # --- list_namespaces --------------------------------------------------------------
@@ -374,8 +389,8 @@ def test_memory_store_factory_uses_the_explicit_id_then_the_environment(api, mon
 
     creates = [call for call in api.calls if call.route == "create"]
     assert [(call.store, call.actor_id) for call in creates] == [
-        ("env-store", "alice"),
-        ("explicit-store", "alice"),
+        ("env-store", "alice:langgraph"),
+        ("explicit-store", "alice:langgraph"),
     ]
 
 
@@ -409,14 +424,14 @@ def test_memory_store_without_a_store_is_in_process_partitioned_by_actor_and_str
 
 def test_value_over_the_size_cap_is_rejected_before_any_call(api):
     store = _store()
-    overhead = len(json.dumps({"blob": ""}, separators=(",", ":")))
+    overhead = len(_env({"blob": ""}))
     cap = store_mod._CONTENT_MAX_BYTES
 
     store.put(("ns",), "at-cap", {"blob": "x" * (cap - overhead)})
     assert api.routes() == ["create"]
 
     api.calls.clear()
-    with pytest.raises(ValueError, match="bytes as JSON"):
+    with pytest.raises(ValueError, match="bytes as stored JSON"):
         store.put(("ns",), "over", {"blob": "x" * (cap - overhead + 1)})
     assert api.calls == []
 

@@ -156,7 +156,7 @@ async def test_fifty_concurrent_async_runs_do_not_mix_users(api, mode):
     assert [result["found"] for result in results] == [
         {"text": f"note of {user}"} for user in users
     ]
-    assert {call.actor_id for call in _creates(api)} == set(users)
+    assert {call.actor_id for call in _creates(api)} == {f"{user}:langgraph" for user in users}
     assert len(api.rows()) == 50
 
 
@@ -181,7 +181,7 @@ def test_explicit_actor_is_checked_against_the_run_actor(api, run_actor, expect_
         assert api.calls == []
         return
     graph.invoke({"text": "x"}, config=config)
-    assert {call.actor_id for call in _creates(api)} == {"alice"}
+    assert {call.actor_id for call in _creates(api)} == {"alice:langgraph"}
 
 
 def test_warns_once_when_the_actor_defaults_to_the_session_id(api, caplog, monkeypatch):
@@ -194,7 +194,7 @@ def test_warns_once_when_the_actor_defaults_to_the_session_id(api, caplog, monke
 
     warned = [r for r in caplog.records if "session id" in r.getMessage()]
     assert len(warned) == 1
-    assert {call.actor_id for call in _creates(api)} == {"s9"}
+    assert {call.actor_id for call in _creates(api)} == {"s9:langgraph"}
 
 
 @pytest.mark.parametrize(
@@ -218,7 +218,7 @@ def test_strict_mode_needs_the_user_key_to_match_the_actor(api, langgraph_user_i
         assert api.calls == []
         return
     assert graph.invoke({"text": "mine"}, config=config)["found"] == {"text": "mine"}
-    assert {call.actor_id for call in api.calls} == {"alice"}
+    assert {call.actor_id for call in api.calls} == {"alice:langgraph"}
 
 
 def test_outside_a_run_the_actor_kwarg_is_used_and_no_actor_raises(api):
@@ -227,7 +227,7 @@ def test_outside_a_run_the_actor_kwarg_is_used_and_no_actor_raises(api):
     item = store.get(("ns",), "k")
     assert item is not None and item.value == {"v": 1}
     assert [call.route for call in api.calls] == ["create", "list"]
-    assert {call.actor_id for call in api.calls} == {"alice"}
+    assert {call.actor_id for call in api.calls} == {"alice:langgraph"}
 
     with pytest.raises(ValueError, match="needs a run config"):
         store_mod.DatabricksMemoryStore(store=STORE).put(("ns",), "k", {"v": 2})
