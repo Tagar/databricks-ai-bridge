@@ -17,6 +17,7 @@ from typing import Any, Iterator, Optional, Sequence
 
 from databricks.sdk import WorkspaceClient
 
+from databricks_agentkit._actors import check_actor
 from databricks_agentkit.runtime.workspace import workspace_client as default_workspace_client
 
 _API_ROOT = "/api/2.0/agents"
@@ -65,6 +66,7 @@ class SessionStoreClient:
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> Session:
+        check_actor(actor_id)
         body: dict[str, Any] = {"actor_id": actor_id}
         if metadata:
             body["metadata"] = metadata
