@@ -64,6 +64,7 @@ class Session:
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> Session:
+        """Fork under ``actor_id``; raises ValueError if it ends with ``:langgraph``."""
         return self._client._fork_session(
             self,
             actor_id=actor_id,
@@ -144,6 +145,7 @@ class SessionStore:
         parent_session_id: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> Session:
+        """Create a session under ``actor_id``; raises ValueError if it ends with ``:langgraph``."""
         return self._client._add_session(
             self,
             actor_id=actor_id,
@@ -244,9 +246,10 @@ class SessionStores:
         parent_session_id: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> Session:
+        check_actor(actor_id)
         response = self._api.create_session(
             store.name,
-            check_actor(actor_id),
+            actor_id,
             session_id=session_id,
             parent_session_id=parent_session_id,
             metadata=metadata,
@@ -308,10 +311,11 @@ class SessionStores:
         session_id: Optional[str] = None,
         metadata: Optional[dict[str, str]] = None,
     ) -> Session:
+        check_actor(actor_id)
         response = self._api.fork_session(
             session.store_name,
             session.session_id,
-            check_actor(actor_id),
+            actor_id,
             up_to_item_id=up_to_item_id,
             session_id=session_id,
             metadata=metadata,

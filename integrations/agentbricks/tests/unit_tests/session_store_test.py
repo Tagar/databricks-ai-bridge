@@ -123,14 +123,34 @@ def test_add_get_and_list_sessions() -> None:
     api.get_session.assert_called_once_with(SESSION_ID, SESSION_STORE)
 
 
-def test_add_refuses_reserved_langgraph_storage_actor() -> None:
+@pytest.mark.parametrize("actor", ["customer-123:langgraph", "Customer-123:LangGraph"])
+def test_add_refuses_reserved_langgraph_storage_actor(actor: str) -> None:
     client, api = resource_client()
     api.get_session_store.return_value = session_store_payload()
     store = client.session_stores.get(SESSION_STORE)
 
-    with pytest.raises(ValueError, match=":langgraph"):
-        store.add(actor_id="customer-123:langgraph")
+    with pytest.raises(ValueError, match="can't end with ':langgraph'"):
+        store.add(actor_id=actor)
     api.create_session.assert_not_called()
+
+
+@pytest.mark.parametrize("actor", ["langgraph", "customer-123:langgraph "])
+def test_add_allows_langgraph_actor_without_the_reserved_suffix(actor: str) -> None:
+    """Near-miss ids pass: no colon, or trailing whitespace (the service keeps actors verbatim)."""
+    client, api = resource_client()
+    api.get_session_store.return_value = session_store_payload()
+    api.create_session.return_value = session_payload(actor_id=actor)
+    store = client.session_stores.get(SESSION_STORE)
+
+    store.add(actor_id=actor)
+
+    api.create_session.assert_called_once_with(
+        SESSION_STORE,
+        actor,
+        session_id=None,
+        parent_session_id=None,
+        metadata=None,
+    )
 
 
 def test_update_and_delete_session() -> None:
@@ -185,15 +205,37 @@ def test_fork_unwraps_session_field() -> None:
     )
 
 
-def test_fork_refuses_reserved_langgraph_storage_actor() -> None:
+@pytest.mark.parametrize("actor", ["agent:langgraph", "Agent:LangGraph"])
+def test_fork_refuses_reserved_langgraph_storage_actor(actor: str) -> None:
     client, api = resource_client()
     api.get_session_store.return_value = session_store_payload()
     api.get_session.return_value = session_payload()
     session = client.session_stores.get(SESSION_STORE).get(SESSION_ID)
 
-    with pytest.raises(ValueError, match=":langgraph"):
-        session.fork(actor_id="agent:langgraph")
+    with pytest.raises(ValueError, match="can't end with ':langgraph'"):
+        session.fork(actor_id=actor)
     api.fork_session.assert_not_called()
+
+
+@pytest.mark.parametrize("actor", ["langgraph", "agent:langgraph "])
+def test_fork_allows_langgraph_actor_without_the_reserved_suffix(actor: str) -> None:
+    """Near-miss ids pass: no colon, or trailing whitespace (the service keeps actors verbatim)."""
+    client, api = resource_client()
+    api.get_session_store.return_value = session_store_payload()
+    api.get_session.return_value = session_payload()
+    api.fork_session.return_value = session_payload(actor_id=actor)
+    session = client.session_stores.get(SESSION_STORE).get(SESSION_ID)
+
+    session.fork(actor_id=actor)
+
+    api.fork_session.assert_called_once_with(
+        SESSION_STORE,
+        SESSION_ID,
+        actor,
+        up_to_item_id=None,
+        session_id=None,
+        metadata=None,
+    )
 
 
 def test_item_operations_and_pagination() -> None:

@@ -19,6 +19,7 @@ from databricks_agentkit._api_client import (
     memory_store_path,
     session_store_path,
 )
+from databricks_agentkit.runtime.session_store_client import SessionStoreClient
 
 
 @pytest.mark.parametrize("code", ["INVALID_PARAMETER_VALUE", "BAD_REQUEST"])
@@ -642,6 +643,17 @@ def test_create_session_puts_session_id_in_query(workspace_client):
 
 
 @mock.patch("databricks.sdk.WorkspaceClient")
+def test_create_and_fork_session_refuse_langgraph_actors(workspace_client):
+    """The transport refuses the reserved actor, covering the CLI's create/fork commands."""
+    c, do = _client(workspace_client)
+    with pytest.raises(ValueError, match="can't end with ':langgraph'"):
+        c.create_session("store1", "alice:langgraph")
+    with pytest.raises(ValueError, match="can't end with ':langgraph'"):
+        c.fork_session("store1", "sid", "Alice:LangGraph")
+    do.assert_not_called()
+
+
+@mock.patch("databricks.sdk.WorkspaceClient")
 def test_get_session_uses_store_scoped_path(workspace_client):
     c, do = _client(workspace_client)
     c.get_session("sid", store="store1")
@@ -1029,3 +1041,12 @@ def test_delete_session_store_normalizes_path(workspace_client):
     client, do = _client(workspace_client)
     client.delete_session_store("session-stores/s1")
     do.assert_called_once_with("DELETE", "/api/2.0/agents/session-stores/s1", query=None, body=None)
+
+
+def test_runtime_session_store_client_refuses_langgraph_actor():
+    """The vendored runtime client refuses too: OpenAI sessions and templates call it directly."""
+    workspace = mock.Mock()
+    client = SessionStoreClient(workspace).set_session_store("store1")
+    with pytest.raises(ValueError, match="can't end with ':langgraph'"):
+        client.create_session(actor_id="alice:langgraph")
+    workspace.api_client.do.assert_not_called()

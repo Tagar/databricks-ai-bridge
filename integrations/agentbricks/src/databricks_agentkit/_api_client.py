@@ -17,6 +17,7 @@ from urllib.parse import quote
 
 from databricks_agentbricks.errors import TRANSIENT_ERROR_CODES, AgentCliError, wrap_api_error
 from databricks_agentkit import models
+from databricks_agentkit._actors import check_actor
 from databricks_agentkit.runtime import model_services, prompt_registry
 
 if TYPE_CHECKING:
@@ -772,6 +773,7 @@ class _AgentBricksApiClient:
         parent_session_id: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> models.Session:
+        check_actor(actor_id)
         body = _body(actor_id=actor_id, parent_session_id=parent_session_id, metadata=metadata)
         return _as(
             models.Session,
@@ -833,6 +835,7 @@ class _AgentBricksApiClient:
         session_id: Optional[str] = None,
         metadata: Optional[dict] = None,
     ) -> models.Session:
+        check_actor(actor_id)
         body = _body(
             source_session_id=source_session_id,
             actor_id=actor_id,
